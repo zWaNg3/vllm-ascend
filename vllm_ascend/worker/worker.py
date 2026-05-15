@@ -212,7 +212,7 @@ class NPUWorker(WorkerBase):
             self.backup_expert_rank_mapping = False
             init_elastic_info(self.use_mask_mc2, ep_size, (self.num_logical_expert + num_redundancy_expert))
 
-    def dp_descale(self, exclude_ep_ranks: list[int], vllm_update_config):
+    def dp_descale(self, exclude_ep_ranks: list[int], vllm_update_config, coord_store):
         """
         Reconfigure data-parallel (DP) layout and MoE expert placement after
         excluding one or more DP ranks (e.g., due to failure).
@@ -336,7 +336,7 @@ class NPUWorker(WorkerBase):
         # reinit comm_group
         destroy_comm_group(self.use_mask_mc2)
         with set_current_vllm_config(self.vllm_config):
-            reinit_comm_group(self.use_mask_mc2, self.vllm_config, self)
+            reinit_comm_group(self.use_mask_mc2, self.vllm_config, self, coord_store)
 
         # update AscendFusedMoE
         reconfigure_moe(

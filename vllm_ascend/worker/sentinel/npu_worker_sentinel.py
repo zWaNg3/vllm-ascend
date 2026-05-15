@@ -115,13 +115,15 @@ class NPUWorkerSentinel(BaseSentinel):
         get_pause_event().clear()
         exclude_ep_ranks = ft_request.params["exclude_ep_ranks"]
         vllm_config_update_dict = ft_request.params["vllm_config_update_dict"]
+        self._coord_store_port = ft_request.params["coord_store_port"]
+        store = get_cached_tcp_store_client(
+            self.data_parallel_master_ip, self._coord_store_port
+        )
         NPUPlatform.set_device(self.device)
         torch_npu.npu.restart_device(self.device.index)
         self.clear_input_batch_callback()
-        # comm_groups = get_all_model_groups()
-        # for group in comm_groups:
         torch_npu.distributed.reinit_process_group(None, False)
         torch.npu.synchronize()
-        self.worker.dp_descale(exclude_ep_ranks, vllm_config_update_dict)
+        self.worker.dp_descale(exclude_ep_ranks, vllm_config_update_dict, store)
         self.worker.execute_dummy_batch()
         return FaultToleranceResult(ft_request.request_id, True)

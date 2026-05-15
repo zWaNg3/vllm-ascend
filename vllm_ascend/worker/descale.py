@@ -37,7 +37,7 @@ else:
     NPUModelRunner = None
     NPUWorker = None
 
-
+_PORTS_FMT = "!3I"
 # TODO: Refactor descale.py - use descaler object instead of NpuWorker attrs to streamline code
 
 
@@ -222,13 +222,30 @@ def destroy_comm_group(use_mask_mc2: bool) -> None:
         cleanup_dist_env_and_memory()
 
 
-def init_dp_cpu_group(vllm_config: VllmConfig, group_type="normal") -> None:
+def init_dp_cpu_group(vllm_config: VllmConfig, coord_store, group_type="normal") -> None:
+    key = ["dp_cpu_group_0", "eplb_cpu_group_0"]
+    socks = []
+    ports = []
+    if vllm_config.parallel_config.data_parallel_rank == 0:
+        for i in range(2):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind((host, 0))
+            s.listen()
+            socks.append(s)
+            ports.append(s.getsockname()[1])
+        coord_store.set(key, struct.pack(_PORTS_FMT, *ports))
+    else:
+        ports = list(struct.unpack(_PORTS_FMT, coord_store.get(key)))
+        s = []
+
+    eplb_port, dp_port = ports
     if get_ascend_config().eplb_config.dynamic_eplb:
         get_dynamic_eplb_group().cpu_group = stateless_init_torch_distributed_process_group(
             vllm_config.parallel_config.data_parallel_master_ip,
-            vllm_config.parallel_config.data_parallel_master_port + 200,
+            eplb_port,
             vllm_config.parallel_config.data_parallel_rank,
             vllm_config.parallel_config.data_parallel_size,
+            listen_socket=socks[0],
             backend="gloo",
             gloo_timeout_seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout,
         )
@@ -237,19 +254,20 @@ def init_dp_cpu_group(vllm_config: VllmConfig, group_type="normal") -> None:
     # TODO: Temporarily hardcode the port value for debugging. Will replace with get_open_port().
     get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
         vllm_config.parallel_config.data_parallel_master_ip,
-        vllm_config.parallel_config.data_parallel_master_port + 100,
+        dp_port,
         vllm_config.parallel_config.data_parallel_rank,
         vllm_config.parallel_config.data_parallel_size,
         backend="gloo",
+        listen_socket=socks[1],
     )
     get_dp_group().group_type = group_type
     timeout = timedelta(seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout)
     _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
 
 
-def reinit_comm_group(use_mask_mc2: bool, vllm_config: VllmConfig, worker: NPUWorker) -> None:
+def reinit_comm_group(use_mask_mc2: bool, vllm_config: VllmConfig, worker: NPUWorker, coord_store) -> None:
     if use_mask_mc2:
-        init_dp_cpu_group(vllm_config, "stateless")
+        init_dp_cpu_group(vllm_config, coord_store, "stateless")
     else:
         worker._init_worker_distributed_environment()
 
