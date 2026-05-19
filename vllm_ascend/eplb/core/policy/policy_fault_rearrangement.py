@@ -35,6 +35,7 @@ class FaultRearrangement(EplbPolicy):
         self.n_add_expert_per_card = 0
         self.failed_cards = []
         self.enable_d2d_after_failure = False
+        self.rank_id_to_node_id = None
 
     def get_original_workload(self) -> np.ndarray:
         workload_new = np.zeros((self.n_layer, self.n_experts))
@@ -243,36 +244,59 @@ class FaultRearrangement(EplbPolicy):
 
     def _load_no_backup_experts(
         self,
-        old_deployment: np.ndarray,
-        redundant_expert_pos: list[list[int]],
-        no_backup_experts: list[int],
-        expert_from_rank: list[int],
+        old_deployment,
+        redundant_expert_pos,
+        no_backup_experts,
+        expert_from_rank,
     ) -> defaultdict[int, list[tuple[int, int]]]:
-        sorted_result = []
-        for card_id in range(self.n_remain_cards):
-            if len(redundant_expert_pos[card_id]) > 0:
-                sorted_result.append((card_id, len(redundant_expert_pos[card_id])))
+        if self.rank_id_to_node_id is None:
+            raise ValueError(
+                "self.rank_id_to_node_id was not assigned before calling this function"
+            )
 
-        sorted_result.sort(key=lambda x: x[1], reverse=True)
-        sorted_card_id = [item[0] for item in sorted_result]
+        node_cards = defaultdict(list)
+        for card_id in range(self.n_remain_cards):
+            if redundant_expert_pos[card_id]:
+                node_id = self.rank_id_to_node_id[card_id]
+                node_cards[node_id].append(card_id)
+
+        for cards in node_cards.values():
+            cards.sort(key=lambda c: len(redundant_expert_pos[c]), reverse=True)
+
+        active_nodes = sorted(
+            node_cards.keys(), key=lambda n: sum(len(redundant_expert_pos[c]) for c in node_cards[n]), reverse=True
+        )
+        node_idx = 0
 
         need_load_h2d = defaultdict(list)
-        index = 0
 
-        while no_backup_experts:
-            card_id = sorted_card_id[index]
-            if redundant_expert_pos[card_id]:
-                expert_id = no_backup_experts.pop()
-                pos = redundant_expert_pos[card_id].pop()
-                old_deployment[card_id][pos] = int(expert_id)
-                expert_from_rank[expert_id] = card_id
-                need_load_h2d[card_id].append((pos, int(expert_id)))
-                index += 1
-            else:
-                sorted_card_id.pop(index)
+        while no_backup_experts and active_nodes:
+            node_id = active_nodes[node_idx]
+            cards = node_cards[node_id]
 
-            assert len(sorted_card_id) > 0, "No available cards left"
-            index = index % len(sorted_card_id)
+            card_id = cards[0]
+
+            expert_id = no_backup_experts.pop()
+            pos = redundant_expert_pos[card_id].pop()
+            old_deployment[card_id][pos] = int(expert_id)
+            expert_from_rank[expert_id] = card_id
+            need_load_h2d[card_id].append((pos, int(expert_id)))
+
+            if not redundant_expert_pos[card_id]:
+                cards.pop(0)
+                if not cards:
+                    active_nodes.pop(node_idx)
+                    if not active_nodes:
+                        break
+                    node_idx %= len(active_nodes)
+                    continue
+            node_idx = (node_idx + 1) % len(active_nodes)
+
+        if no_backup_experts:
+            raise ValueError(
+                f"Insufficient redundant expert capacity to place all no-backup experts;"
+                f"{len(no_backup_experts)} expert remain undeployed"
+            )
 
         return need_load_h2d
 

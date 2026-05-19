@@ -11,7 +11,7 @@ from vllm.config import ParallelConfig
 from vllm.distributed import get_pp_group, get_tp_group
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.distributed.utils import stateless_init_torch_distributed_process_group
-from vllm.logger import init_logger
+from vllm.logger import logger
 from vllm.utils.network_utils import close_sockets, make_zmq_socket
 from vllm.v1.fault_tolerance import BaseSentinel
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
@@ -19,7 +19,7 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 from vllm_ascend.platform import NPUPlatform
 
-logger = init_logger(__name__)
+
 _GLOBAL_PAUSE_EVENT = threading.Event()
 
 

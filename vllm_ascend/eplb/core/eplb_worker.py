@@ -35,7 +35,11 @@ class EplbWorker:
         self.enable_d2d = enable_d2d
         self.rank_id = dist.get_rank()
         self.multi_stage = policy_type == 3
-        self.rank_id_to_initial_global = list(range(dist.get_world_size()))
+
+        n_total_ranks = dist.get_world_size()
+        n_ranks_per_node = torch.npu.device_count()
+        self.rank_id_to_initial_global = list(range(n_total_ranks))
+        self.rank_id_to_node_id = [rank_id // n_ranks_per_node for rank_id in range(n_total_ranks)]
 
     def do_update(self):
         # put data in to queue
@@ -73,7 +77,6 @@ class EplbWorker:
             self.old_expert_maps = self.local2global(old_placement)
             self.shared_dict["need_load_h2d"] = need_load_h2d
             self.shared_dict["num_add_experts_per_rank"] = num_add_experts_per_rank
-            self.shared_dict["descale"] = False
         else:
             num_add_experts_per_rank = 0
             _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
@@ -88,7 +91,11 @@ class EplbWorker:
         self.old_expert_maps = new_expert_maps
         logger.debug("EPLB Process compute complete")
 
-        packed_update_info = self.pack_update_info(update_info)
+        if self.shared_dict["descale"] and not self.shared_dict["enable_d2d_after_failure"]:
+            packed_update_info = []
+        else:
+            packed_update_info = self.pack_update_info(update_info)
+        self.shared_dict["descale"] = False
 
         if num_add_experts_per_rank > 0:
             self.rank_id_to_initial_global = list(range(len(self.rank_id_to_initial_global)))
@@ -278,6 +285,7 @@ class EplbWorker:
         policy = PolicyFactory.generate_policy(4)
         policy.failed_cards = exclude_dp_ranks
         policy.enable_d2d_after_failure = enable_d2d_after_failure
+        policy.rank_id_to_node_id = self.rank_id_to_node_id
 
         new_deployment, old_deployment, need_load_h2d, num_add_experts_per_rank = policy.rebalance_experts(
             old_placement, load_info
@@ -296,6 +304,7 @@ class EplbWorker:
         self.rank_id = self.rank_id - fault_count
         for i in sorted(exclude_dp_ranks, reverse=True):
             self.rank_id_to_initial_global.pop(i)
+            self.rank_id_to_node_id.pop(i)
 
     def warm_up_shared_dict(self):
         old_expert_maps = self.get_init_expert_maps()
