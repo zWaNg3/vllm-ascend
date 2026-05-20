@@ -10,7 +10,7 @@ import zmq
 from vllm.config import ParallelConfig
 from vllm.distributed import get_pp_group, get_tp_group
 from vllm.distributed.parallel_state import get_dp_group
-from vllm.distributed.utils import stateless_init_torch_distributed_process_group, get_cached_tcp_store_client
+from vllm.distributed.utils import get_cached_tcp_store_client, stateless_init_torch_distributed_process_group
 from vllm.logger import logger
 from vllm.utils.network_utils import close_sockets, make_zmq_socket
 from vllm.v1.fault_tolerance import BaseSentinel
@@ -115,9 +115,7 @@ class NPUWorkerSentinel(BaseSentinel):
         exclude_ep_ranks = ft_request.params["exclude_ep_ranks"]
         vllm_config_update_dict = ft_request.params["vllm_config_update_dict"]
         self._coord_store_port = ft_request.params["coord_store_port"]
-        store = get_cached_tcp_store_client(
-            self.data_parallel_master_ip, self._coord_store_port
-        )
+        store = get_cached_tcp_store_client(self.data_parallel_master_ip, self._coord_store_port)
         NPUPlatform.set_device(self.device)
         torch_npu.npu.restart_device(self.device.index)
         self.clear_input_batch_callback()
