@@ -70,16 +70,13 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.descale import (
     d2d_transmission_for_scaling_down,
-    destroy_acl_graph,
     destroy_comm_group,
-    expand_expert_weights,
     gen_all_layer_log2phy,
     get_expert_distribution_after_descale,
+    init_dp_cpu_group,
     init_elastic_info,
     init_ep2dp_map,
-    rebuild_acl_graph,
     reconfigure_moe,
-    reinit_comm_group,
     reload_fault_expert_weights,
     save_expert_weights_to_ram,
     update_elastic_info,
@@ -100,7 +97,6 @@ torch_non_c_binding_in_graph_functions_npu = dict.fromkeys(
 )  # noqa: E402
 torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFunctionVariable  # noqa: E402
 torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
-FAULT_TOLERANCE_MEM_UTILIZATION = 0.95
 
 
 class NPUWorker(WorkerBase):
@@ -210,7 +206,7 @@ class NPUWorker(WorkerBase):
                 self.use_mask_mc2 = True
 
             self.backup_expert_rank_mapping = False
-            init_elastic_info(self.use_mask_mc2, ep_size, (self.num_logical_expert + num_redundancy_expert))
+            init_elastic_info(ep_size, (self.num_logical_expert + num_redundancy_expert))
 
     def dp_descale(self, exclude_ep_ranks: list[int], vllm_update_config, coord_store):
         """
@@ -256,8 +252,6 @@ class NPUWorker(WorkerBase):
         if not self.backup_expert_rank_mapping:
             raise RuntimeError("not load model yet")
 
-        self.cache_config.gpu_memory_utilization = FAULT_TOLERANCE_MEM_UTILIZATION
-        # rank = self.vllm_config.parallel_config.data_parallel_rank
         rank_mapping = vllm_update_config.get("rank_mapping")
         rank = rank_mapping[self.parallel_config.data_parallel_rank]
         assert rank_mapping is not None
@@ -285,10 +279,7 @@ class NPUWorker(WorkerBase):
 
         if num_add_experts_per_rank > 0:
             self.use_mask_mc2 = False
-
-        # clean acl_graph and comm_group
-        if not self.model_config.enforce_eager and not self.use_mask_mc2:
-            self.vllm_config = destroy_acl_graph(self.use_mask_mc2, self.vllm_config, self.model_runner)
+            raise RuntimeError("only support mask mc2")
 
         # reload fault expert weights
         self.experts_saved_weights = save_expert_weights_to_ram(
@@ -297,8 +288,6 @@ class NPUWorker(WorkerBase):
             self.model_runner,
             self.quant,
         )
-
-        expand_expert_weights(self.model_runner, num_add_experts_per_rank, self.quant)
 
         reload_fault_expert_weights(
             self.model_runner,
@@ -331,25 +320,20 @@ class NPUWorker(WorkerBase):
         self.ep2dp_map = update_ep2dp_map(self.ep2dp_map, exclude_ep_ranks, rank_mapping)
         elastic_info = get_elastic_info()
         num_new_phy_experts = (self.model_runner.shared_dict["expert_maps"][0] != -1).sum().item()
-        update_elastic_info(self.use_mask_mc2, elastic_info, num_new_phy_experts, old_ep_size, self.ep2dp_map)
+        update_elastic_info(elastic_info, num_new_phy_experts, old_ep_size, self.ep2dp_map)
 
         # reinit comm_group
-        destroy_comm_group(self.use_mask_mc2)
+        destroy_comm_group()
         with set_current_vllm_config(self.vllm_config):
-            reinit_comm_group(self.use_mask_mc2, self.vllm_config, self, coord_store)
-
+            init_dp_cpu_group(self.vllm_config, coord_store, "stateless")
         # update AscendFusedMoE
         reconfigure_moe(
-            self.use_mask_mc2,
             self.model_runner,
             self.vllm_config,
             num_logical_expert,
             num_new_phy_experts,
             all_layer_log2phy,
         )
-        # rebuild acl_graph
-        if not self.model_config.enforce_eager:
-            rebuild_acl_graph(self.use_mask_mc2, self)
 
     def init_dp_device_group(self, vllm_config: VllmConfig) -> None:
         # TODO: Temporarily hardcode the port value for debugging. Will replace with get_open_port().

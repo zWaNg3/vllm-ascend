@@ -1,4 +1,3 @@
-import gc
 import socket
 import struct
 from datetime import timedelta
@@ -8,12 +7,9 @@ import numpy as np
 import torch
 import torch_npu
 from torch.distributed.distributed_c10d import _set_pg_timeout
-from vllm.compilation.wrapper import reset_compile_wrapper
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import VllmConfig
 from vllm.distributed import (
-    cleanup_dist_env_and_memory,
     get_dp_group,
-    get_ep_group,
     get_pcp_group,
     get_tp_group,
     stateless_init_torch_distributed_process_group,
@@ -24,13 +20,10 @@ from vllm.model_executor.model_loader import get_model_loader
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import (
-    destroy_ascend_model_parallel,
     get_dynamic_eplb_group,
-    get_mc2_group,
     set_elastic_info,
 )
-from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map, init_eplb_config
-from vllm_ascend.ops.fused_moe.fused_moe import setup_moe_comm_method
+from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
@@ -193,35 +186,10 @@ def get_expert_distribution_after_descale(
     return cur_rank_need_load_h2d
 
 
-def destroy_acl_graph(use_mask_mc2: bool, vllm_config: VllmConfig, model: NPUModelRunner) -> VllmConfig:
-    if not use_mask_mc2:
-        for entries in vllm_config.compilation_config.concrete_aclgraph_entry_list:
-            for name, entry in entries.items():
-                entry.aclgraph.reset()
-                entry.aclgraph = None
-        vllm_config.compilation_config.concrete_aclgraph_entry_list = []
-
-        with set_current_vllm_config(vllm_config):
-            reset_compile_wrapper(model.get_model())
-        gc.collect()
-        torch.npu.empty_cache()
-    return vllm_config
-
-
-def rebuild_acl_graph(use_mask_mc2: bool, worker: NPUWorker) -> None:
-    if not use_mask_mc2:
-        worker.determine_available_memory()
-        worker.compile_or_warm_up_model()
-
-
-def destroy_comm_group(use_mask_mc2: bool) -> None:
-    if use_mask_mc2:
-        get_dp_group().destroy_cpu_group()
-        if get_ascend_config().eplb_config.dynamic_eplb:
-            get_dynamic_eplb_group().destroy_cpu_group()
-    else:
-        destroy_ascend_model_parallel()
-        cleanup_dist_env_and_memory()
+def destroy_comm_group() -> None:
+    get_dp_group().destroy_cpu_group()
+    if get_ascend_config().eplb_config.dynamic_eplb:
+        get_dynamic_eplb_group().destroy_cpu_group()
 
 
 def init_dp_cpu_group(vllm_config: VllmConfig, coord_store, group_type="normal") -> None:
@@ -265,13 +233,6 @@ def init_dp_cpu_group(vllm_config: VllmConfig, coord_store, group_type="normal")
     get_dp_group().group_type = group_type
     timeout = timedelta(seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout)
     _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
-
-
-def reinit_comm_group(use_mask_mc2: bool, vllm_config: VllmConfig, worker: NPUWorker, coord_store) -> None:
-    if use_mask_mc2:
-        init_dp_cpu_group(vllm_config, coord_store, "stateless")
-    else:
-        worker._init_worker_distributed_environment()
 
 
 def save_expert_weights_to_ram(
@@ -330,43 +291,6 @@ def save_expert_weights_to_ram(
             saved_expert_weights[weight_name] = weight_tensor
 
     return saved_expert_weights
-
-
-def expand_parameter(old_param, axis: int = 0, extra_lines: int = 1) -> torch.nn.Parameter:
-    old_shape = old_param.shape
-    new_shape = list(old_param.shape)
-    new_shape[axis] += extra_lines
-    new_tensor = torch.zeros(
-        size=new_shape,
-        device=old_param.device,
-        dtype=old_param.dtype,
-    )
-    if axis == 0:
-        new_tensor[: old_shape[0]] = old_param.data
-    elif axis == 1:
-        new_tensor[:, : old_shape[1]] = old_param.data
-    else:
-        raise NotImplementedError(f"axis {axis} is not supported")
-    return torch.nn.Parameter(new_tensor, requires_grad=old_param.requires_grad)
-
-
-def expand_expert_weights(model_runner: NPUModelRunner, expand_lines: int, quant: bool | str) -> None:
-    if expand_lines:
-        for module in model_runner.model.modules():
-            if isinstance(module, FusedMoE) and expand_lines:
-                if quant:
-                    # TODO: needs verification
-                    module.w2_weight_list = expand_parameter(module.w2_weight_list, 0, expand_lines)
-                    module.w13_weight_list = expand_parameter(module.w13_weight_list, 0, expand_lines)
-                    module.w2_weight_scale_list = expand_parameter(module.w2_weight_scale_list, 0, expand_lines)
-                    module.w13_weight_scale_fp32_list = expand_parameter(
-                        module.w13_weight_scale_fp32_list, 0, expand_lines
-                    )
-                    module.w2_weight_offset.data = expand_parameter(module.w2_weight_offset.data, 0, expand_lines)
-                    module.w13_weight_offset.data = expand_parameter(module.w13_weight_offset.data, 0, expand_lines)
-                else:
-                    module.w2_weight = expand_parameter(module.w2_weight, 0, expand_lines)
-                    module.w13_weight = expand_parameter(module.w13_weight, 0, expand_lines)
 
 
 def dynamic_merge_view(
@@ -516,73 +440,67 @@ def update_ep2dp_map(
 
 
 def init_elastic_info(
-    use_mask_mc2: bool,
     ep_size: int,
     phy_experts_num: int,
     share_expert_rank_num: int = 0,
 ):
-    if use_mask_mc2:
-        # ----- 1 Basic configuration (first 4 parameters) -----
-        # Meaning: whether to descale (0 = no descale), actual number of ranks after descale
-        # reduction (=ep_size), number of ranks for shared experts,number of MoE experts
-        descale = 0
-        base_config = torch.tensor([descale, ep_size, share_expert_rank_num, phy_experts_num], dtype=torch.int32)
+    # ----- 1 Basic configuration (first 4 parameters) -----
+    # Meaning: whether to descale (0 = no descale), actual number of ranks after descale
+    # reduction (=ep_size), number of ranks for shared experts,number of MoE experts
+    descale = 0
+    base_config = torch.tensor([descale, ep_size, share_expert_rank_num, phy_experts_num], dtype=torch.int32)
 
-        # ----- 2 Mapping tables -----
-        # Table1: epRankID -> localEpRankId(-1 indicates invalid）
-        table1 = torch.arange(0, ep_size, dtype=torch.int32)
-        # Table2: localEpRankId -> epRankID(-1 indicates padding）
-        table2 = torch.arange(0, ep_size, dtype=torch.int32)
+    # ----- 2 Mapping tables -----
+    # Table1: epRankID -> localEpRankId(-1 indicates invalid）
+    table1 = torch.arange(0, ep_size, dtype=torch.int32)
+    # Table2: localEpRankId -> epRankID(-1 indicates padding）
+    table2 = torch.arange(0, ep_size, dtype=torch.int32)
 
-        # ----- 3 Concatenate into a complete 1D Tensor -----
-        elastic_info = torch.cat([base_config, table1, table2], dim=0).npu().contiguous()
+    # ----- 3 Concatenate into a complete 1D Tensor -----
+    elastic_info = torch.cat([base_config, table1, table2], dim=0).npu().contiguous()
 
-        # ---- 4 Configure Tensor properties and set global variables
-        elastic_info.requires_grad_(False)
-        set_elastic_info(elastic_info)
+    # ---- 4 Configure Tensor properties and set global variables
+    elastic_info.requires_grad_(False)
+    set_elastic_info(elastic_info)
 
 
 def update_elastic_info(
-    use_mask_mc2: bool,
     elastic_info: torch.Tensor,
     expert_num: int,
     raw_ep_size: int,
     ep2dp: dict[int, int],
     share_expert_num: int = 0,
 ) -> None:
-    if use_mask_mc2:
-        if elastic_info is None:
-            elastic_info = torch.full((4 + 2 * raw_ep_size,), -1, dtype=torch.int32).npu().contiguous()
-        raw_ep_ranks = sorted(ep2dp.keys())
-        valid_ep_ranks = [ep for ep in raw_ep_ranks if ep2dp[ep] != -1]
-        descale_ep_size = len(valid_ep_ranks)
-        is_descale = 1 if descale_ep_size < raw_ep_size else 0
+    if elastic_info is None:
+        elastic_info = torch.full((4 + 2 * raw_ep_size,), -1, dtype=torch.int32).npu().contiguous()
+    raw_ep_ranks = sorted(ep2dp.keys())
+    valid_ep_ranks = [ep for ep in raw_ep_ranks if ep2dp[ep] != -1]
+    descale_ep_size = len(valid_ep_ranks)
+    is_descale = 1 if descale_ep_size < raw_ep_size else 0
 
-        # Table1: epRankID -> localEpRankId(-1 indicates invalid）
-        table1 = torch.full((raw_ep_size,), -1, dtype=torch.int32, device="cpu")
-        for local_ep_rank, ep_rank in enumerate(valid_ep_ranks):
-            table1[ep_rank] = local_ep_rank
+    # Table1: epRankID -> localEpRankId(-1 indicates invalid）
+    table1 = torch.full((raw_ep_size,), -1, dtype=torch.int32, device="cpu")
+    for local_ep_rank, ep_rank in enumerate(valid_ep_ranks):
+        table1[ep_rank] = local_ep_rank
 
-        # Table2: localEpRankId -> epRankID(-1 indicates padding）
-        table2 = torch.full((raw_ep_size,), -1, dtype=torch.int32, device="cpu")
-        for local_ep_rank, ep_rank in enumerate(valid_ep_ranks):
-            if local_ep_rank < descale_ep_size:
-                table2[local_ep_rank] = ep_rank
+    # Table2: localEpRankId -> epRankID(-1 indicates padding）
+    table2 = torch.full((raw_ep_size,), -1, dtype=torch.int32, device="cpu")
+    for local_ep_rank, ep_rank in enumerate(valid_ep_ranks):
+        if local_ep_rank < descale_ep_size:
+            table2[local_ep_rank] = ep_rank
 
-        # update elastic_info
-        elastic_info[0] = is_descale
-        elastic_info[1] = descale_ep_size
-        elastic_info[2] = share_expert_num
-        elastic_info[3] = expert_num
-        # update Table1
-        table1_start = 4
-        elastic_info[table1_start : table1_start + raw_ep_size] = table1
-        # update Table2
-        table2_start = table1_start + raw_ep_size
-        elastic_info[table2_start : table2_start + raw_ep_size] = table2
-        set_elastic_info(elastic_info)
-    else:
-        set_elastic_info(None)
+    # update elastic_info
+    elastic_info[0] = is_descale
+    elastic_info[1] = descale_ep_size
+    elastic_info[2] = share_expert_num
+    elastic_info[3] = expert_num
+    # update Table1
+    table1_start = 4
+    elastic_info[table1_start : table1_start + raw_ep_size] = table1
+    # update Table2
+    table2_start = table1_start + raw_ep_size
+    elastic_info[table2_start : table2_start + raw_ep_size] = table2
+    set_elastic_info(elastic_info)
 
 
 def gen_local_log2phy_map(global_log2phy_map: dict[int, list[int]]) -> torch.Tensor:
@@ -600,7 +518,6 @@ def gen_local_log2phy_map(global_log2phy_map: dict[int, list[int]]) -> torch.Ten
 
 
 def reconfigure_moe(
-    use_mask_mc2: bool,
     modelrunner: NPUModelRunner,
     vllm_config: VllmConfig,
     num_global_logical_experts: int,
@@ -649,26 +566,6 @@ def reconfigure_moe(
         module.moe_config.num_local_experts = module.local_num_experts
         module.moe_config.global_redundant_expert_num = module.global_redundant_expert_num
         module.log2phy.copy_(log2phy[cur_layer_id].npu(), non_blocking=True)
-        if not use_mask_mc2:
-            module.moe_config.tp_group = get_tp_group()
-            module.moe_config.dp_group = get_dp_group()
-            module.moe_config.ep_group = get_ep_group()
-            module.moe_config.mc2_group = get_mc2_group()
-            module.moe_config.supports_eplb = module.quant_method.supports_eplb
-            eplb_config = get_ascend_config().eplb_config
-            module.global_expert_map, module._expert_map, _, _ = init_eplb_config(
-                eplb_config, module.moe_counter, module.moe_config
-            )
-            with set_current_vllm_config(vllm_config):
-                setup_moe_comm_method(module.moe_config)
-            changed_moe_load_shape = module.local_num_experts - module.moe_load.shape[0]
-            if modelrunner.dynamic_eplb and changed_moe_load_shape:
-                module.moe_load = expand_parameter(module.moe_load, 0, changed_moe_load_shape)
-            if vllm_config.model_config.quantization is not None:
-                from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicFusedMoEMethod
-
-                module.quant_method.quant_method = AscendW8A8DynamicFusedMoEMethod()
-                # todo support other quant like w4a4 w4a8 ...
 
 
 def update_eplb_adaptor_info(model_runner, num_add_experts_per_rank, rank):
