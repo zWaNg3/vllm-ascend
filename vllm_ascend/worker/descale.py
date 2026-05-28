@@ -490,16 +490,11 @@ def update_elastic_info(
             table2[local_ep_rank] = ep_rank
 
     # update elastic_info
-    elastic_info[0] = is_descale
-    elastic_info[1] = descale_ep_size
-    elastic_info[2] = share_expert_num
-    elastic_info[3] = expert_num
-    # update Table1
-    table1_start = 4
-    elastic_info[table1_start : table1_start + raw_ep_size] = table1
-    # update Table2
-    table2_start = table1_start + raw_ep_size
-    elastic_info[table2_start : table2_start + raw_ep_size] = table2
+    new_elastic_info_cpu = torch.cat(
+        [torch.tensor([is_descale, descale_ep_size, share_expert_num, expert_num], dtype=torch.int32), table1, table2],
+        dim=0,
+    )
+    elastic_info.copy_(new_elastic_info_cpu)
     set_elastic_info(elastic_info)
 
 
