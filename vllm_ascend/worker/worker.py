@@ -278,7 +278,7 @@ class NPUWorker(WorkerBase):
         num_add_experts_per_rank = self.model_runner.shared_dict["num_add_experts_per_rank"]
 
         if num_add_experts_per_rank > 0:
-            self.use_mask_mc2 = False
+            # use_mask_mc2 is False
             raise RuntimeError("only support mask mc2")
 
         # reload fault expert weights
@@ -337,6 +337,7 @@ class NPUWorker(WorkerBase):
 
     def init_dp_device_group(self, vllm_config: VllmConfig) -> None:
         # TODO: Temporarily hardcode the port value for debugging. Will replace with get_open_port().
+        assert self.vllm_config.parallel_config.enable_fault_tolerance is True, "enable_fault_tolerance is False"
         get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
             vllm_config.parallel_config.data_parallel_master_ip,
             vllm_config.parallel_config.data_parallel_master_port + 100,
@@ -440,6 +441,8 @@ class NPUWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def create_worker_sentinel(self, worker_cmd_addr: str):
+        assert self.vllm_config.parallel_config.enable_fault_tolerance is True, "enable_fault_tolerance is False"
+
         def clear_input_batch_callback():
             input_batch = self.model_runner.input_batch
             cached_req_ids = input_batch.req_id_to_index.keys()
