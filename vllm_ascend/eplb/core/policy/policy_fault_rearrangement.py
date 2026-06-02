@@ -2,8 +2,7 @@ from collections import defaultdict
 
 import numpy as np
 import torch
-
-from .policy_abstract import EplbPolicy
+from .policy_abstract import DynamicConfig, EplbPolicy
 
 
 class DynamicTable:
@@ -23,8 +22,8 @@ class DynamicTable:
 
 
 class FaultRearrangement(EplbPolicy):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, config: DynamicConfig):
+        super().__init__(config)
 
         self.n_experts = None
         self.k_replicas = None
