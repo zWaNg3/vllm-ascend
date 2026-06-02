@@ -58,7 +58,7 @@ from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
-from vllm_ascend.distributed.parallel_state import get_elastic_info, init_ascend_model_parallel
+from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.utils import (
     AscendDeviceType,
@@ -68,12 +68,8 @@ from vllm_ascend.utils import (
     register_ascend_customop,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-from vllm_ascend.worker.scale_down import (
-    ScaleDownHelper,
-    init_elastic_info,
-    init_ep2dp_map,
-)
 from vllm_ascend.worker.sentinel.npu_worker_sentinel import NPUWorkerSentinel
+from vllm_ascend.worker.sentinel.scale_down import init_elastic_info, init_ep2dp_map
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -193,91 +189,6 @@ class NPUWorker(WorkerBase):
 
             self.model_loaded = False
             init_elastic_info(ep_size, (self.num_logical_expert + num_redundant_experts))
-
-    def scale_down(self, excluded_ep_ranks: list[int], scale_down_config, coord_store):
-        """
-        Reconfigure data-parallel (DP) layout and MoE expert placement after
-        excluding one or more DP ranks (e.g., due to failure).
-
-        Args:
-            excluded_ep_ranks: EP ranks to exclude from service.
-            scale_down_config: Dict containing rank_mapping and new parallel config.
-            coord_store: TCP store for coordinating group reinitialization.
-        """
-        assert self.vllm_config.parallel_config.enable_fault_tolerance is True, "enable_fault_tolerance is False"
-        if not self.model_loaded:
-            raise RuntimeError("not load model yet")
-
-        rank_mapping = scale_down_config.get("rank_mapping")
-        assert rank_mapping is not None
-        assert isinstance(rank_mapping, dict)
-
-        new_dp_rank = rank_mapping[self.parallel_config.data_parallel_rank]
-
-        num_logical_expert = self.num_logical_expert
-
-        enable_d2d_rebalance = self.vllm_config.parallel_config.fault_tolerance_config.enable_fault_tolerance_rebalance
-        if self.model_runner.shared_dict["moe_load"] is None or torch.all(
-            self.model_runner.shared_dict["moe_load"][0] == 0
-        ):
-            enable_d2d_rebalance = False
-
-        scale_down_helper = ScaleDownHelper(self.vllm_config, self.model_runner, self.quant)
-        # Currently,only TP=1 is supported.Therefore excluded_dp_ranks = excluded_ep_ranks
-        # TODO: In scenarios TP>1,the logic for converting from
-        #  excluded_ep_ranks to excluded_dp_ranks needs to be added
-        excluded_dp_ranks = excluded_ep_ranks
-
-        # Phase 1: Expert distribution recalculation
-        experts_to_load = scale_down_helper.get_expert_distribution_after_scale_down(
-            excluded_dp_ranks, enable_d2d_rebalance, new_dp_rank
-        )
-        num_add_experts_per_rank = self.model_runner.shared_dict["num_add_experts_per_rank"]
-
-        if num_add_experts_per_rank > 0:
-            # use_mask_mc2 is False
-            raise RuntimeError("only support mask mc2")
-
-        # Phase 2: Expert weight reloading
-        saved_weights = scale_down_helper.load_expert_weights_to_cpu(experts_to_load)
-        scale_down_helper.reload_expert_weights(experts_to_load, saved_weights)
-
-        # Phase 3：EPLB adaptor update
-        if get_ascend_config().eplb_config.dynamic_eplb:
-            scale_down_helper.update_eplb_adaptor_info(num_add_experts_per_rank, new_dp_rank)
-
-        # Phase 4: Log2phy map generation
-        if enable_d2d_rebalance:
-            all_layer_log2phy = scale_down_helper.d2d_transmission_for_scaling_down()
-        else:
-            all_layer_log2phy = scale_down_helper.gen_all_layer_log2phy(new_dp_rank)
-
-        self.global_experts_distribution = self.model_runner.eplb_process.worker.local2global(
-            self.model_runner.shared_dict["expert_maps"]
-        )
-
-        # Phase 5: Configuration and state update
-        old_ep_size = len(self.ep2dp_map)
-        scale_down_helper.update_parallel_config(scale_down_config)
-        self.model_runner.dp_size = self.vllm_config.parallel_config.data_parallel_size
-        self.model_runner.dp_rank = self.vllm_config.parallel_config.data_parallel_rank
-        logger.info(
-            f"self.ep2dp_map is {self.ep2dp_map} "
-            f"excluded_dp_ranks is {excluded_dp_ranks} "
-            f"rank_mapping is {rank_mapping}"
-        )
-        self.ep2dp_map = scale_down_helper.update_ep2dp_map(self.ep2dp_map, excluded_dp_ranks, rank_mapping)
-        elastic_info = get_elastic_info()
-        num_new_phy_experts = (self.model_runner.shared_dict["expert_maps"][0] != -1).sum().item()
-        scale_down_helper.update_elastic_info(elastic_info, num_new_phy_experts, old_ep_size, self.ep2dp_map)
-
-        # Phase 6: Communication group reinitialization
-        scale_down_helper.destroy_comm_group()
-        with set_current_vllm_config(self.vllm_config):
-            scale_down_helper.init_dp_cpu_group(coord_store, "stateless")
-
-        # Phase 7: MoE reconfiguration
-        scale_down_helper.reconfigure_moe(num_logical_expert, num_new_phy_experts, all_layer_log2phy)
 
     def uninstall_static_kernel(self):
         import fcntl

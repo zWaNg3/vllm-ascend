@@ -214,7 +214,7 @@ def pause(host, port, timeout, exclude_dp_rank=None):
 def scale(host, port, timeout, exclude_dp_ranks):
     url = f"http://{host}:{port}/fault_tolerance/apply"
     payload = {
-        "fault_tolerance_instruction": "descale",
+        "fault_tolerance_instruction": "scale_down",
         "fault_tolerance_timeout": timeout,
         "fault_tolerance_params": {"exclude_dp_ranks": exclude_dp_ranks},
     }
