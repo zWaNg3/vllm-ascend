@@ -1,3 +1,4 @@
+import contextlib
 import socket
 import struct
 from copy import copy
@@ -33,7 +34,7 @@ else:
 
 _PORTS_FMT = "!2I"
 # TODO: Refactor scale_down.py - use descaler object instead of NpuWorker attrs to streamline code
-STORE_KEY = ""
+STORE_KEY = "vllm_ascend_fault_tolerance_ports"
 
 BASE_WEIGHT_SUFFIXES = {"down_proj.weight", "up_proj.weight", "gate_proj.weight"}
 QUANT_WEIGHT_SUFFIXES = {
@@ -687,6 +688,10 @@ def init_dp_cpu_group_impl(vllm_config: VllmConfig, coord_store, group_type="nor
     get_dp_group().group_type = group_type
     timeout = timedelta(seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout)
     _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
+
+    for sock in listen_sockets:
+        with contextlib.suppress(OSError):
+            sock.close()
 
 
 def reconfigure_moe(
