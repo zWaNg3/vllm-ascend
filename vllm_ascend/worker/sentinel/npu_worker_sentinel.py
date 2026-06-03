@@ -140,7 +140,7 @@ class NPUWorkerSentinel(BaseSentinel):
         """
         assert self.worker.vllm_config.parallel_config.enable_fault_tolerance is True, "enable_fault_tolerance is False"
         if not self.worker.model_loaded:
-            raise RuntimeError("not load model yet")
+            raise RuntimeError("model has not been loaded yet")
 
         rank_mapping = scale_down_config.get("rank_mapping")
         assert rank_mapping is not None

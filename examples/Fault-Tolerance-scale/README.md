@@ -25,7 +25,7 @@ This directory contains example scripts for vLLM Ascend Fault Tolerance feature,
 bash serve_qwen.sh
 
 # Custom parameters
-bash serve_qwen.sh --dp8 --re 48 --port 8006
+bash serve_qwen.sh --dp 8 --re 48 --port 8006
 ```
 
 **Parameters:**
@@ -94,7 +94,7 @@ Update active_npus list (remove fault NPUS from available list)
 
 ```bash
 # Terminal 1: Start service
-bash serve_qwen.sh --dp 8 --re 48 --fault_port 22876
+bash serve_qwen.sh --dp 8 --re 48 --fault-port 22876
 
 # Terminal 2: Start monitor
 python scale_down.py --npu-ids 0,1,2,3,4,5,6,7 --interval-time 3
