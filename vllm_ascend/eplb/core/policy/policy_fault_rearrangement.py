@@ -2,6 +2,7 @@ from collections import defaultdict
 
 import numpy as np
 import torch
+
 from .policy_abstract import DynamicConfig, EplbPolicy
 
 
@@ -367,8 +368,9 @@ class FaultRearrangement(EplbPolicy):
         n_exist_experts = np.zeros(self.n_experts, dtype=np.int64)
         for rank_id in range(self.n_remain_cards):
             for expert_id in single_layer_deployment[rank_id]:
-                expert_to_rank[expert_id].append(rank_id)
-                n_exist_experts[expert_id] += 1
+                if expert_id != -1:
+                    expert_to_rank[expert_id].append(rank_id)
+                    n_exist_experts[expert_id] += 1
 
         num_redundant_experts = int(np.sum(np.maximum(n_exist_experts - 1, 0)))
         sorted_expert_ids = np.argsort(n_exist_experts)

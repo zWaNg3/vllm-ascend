@@ -282,7 +282,7 @@ class EplbWorker:
         return list(zip(send_all, recv_all, maps, log2phy_all, layer_ids))
 
     def trigger_fault_redeployment(self, load_info, old_placement, exclude_dp_ranks, enable_d2d_after_failure):
-        policy = PolicyFactory.generate_policy(4)
+        policy = PolicyFactory.generate_policy(4, DynamicConfig())
         policy.failed_cards = exclude_dp_ranks
         policy.enable_d2d_after_failure = enable_d2d_after_failure
         policy.rank_id_to_node_id = self.rank_id_to_node_id
@@ -302,7 +302,7 @@ class EplbWorker:
             else:
                 break
         self.rank_id = self.rank_id - fault_count
-        for i in sorted(exclude_dp_ranks, reverse=True):
+        for i in reversed(unique_fault_ids):
             self.rank_id_to_initial_global.pop(i)
             self.rank_id_to_node_id.pop(i)
 
