@@ -183,12 +183,12 @@ class NPUWorker(WorkerBase):
             )
             additional_config = self.vllm_config.additional_config or {}
             eplb_cfg = additional_config.get("eplb_config", {})
-            num_redundant_experts = eplb_cfg.get("num_redundant_experts")
+            num_redundant_experts = int(eplb_cfg.get("num_redundant_experts") or 0)
             if num_redundant_experts and get_ascend_device_type() in {AscendDeviceType.A3}:
                 self.use_mask_mc2 = True
 
             self.model_loaded = False
-            init_elastic_info(ep_size, (self.num_logical_expert + num_redundant_experts))
+            init_elastic_info(ep_size, self.num_logical_expert + num_redundant_experts)
 
     def uninstall_static_kernel(self):
         import fcntl
