@@ -66,7 +66,11 @@ def get_npu_by_dp(dp_rank):
 
 
 def get_dp_by_npu(npu_id):
-    return active_npus.index(npu_id)
+    with active_npus_lock:
+        try:
+            return active_npus.index(npu_id)
+        except ValueError:
+            return -1
 
 
 def is_valid_card_id(card_id):
