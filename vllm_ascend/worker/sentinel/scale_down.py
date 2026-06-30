@@ -663,7 +663,6 @@ def init_dp_cpu_group_impl(vllm_config: VllmConfig, coord_store, group_type="nor
             backend="gloo",
             group_name=_get_unique_name("eplb_group"),
         )
-        get_dynamic_eplb_group().group_type = group_type
         _set_pg_timeout(timeout=timeout, group=get_dynamic_eplb_group().cpu_group)
 
     get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
@@ -676,8 +675,6 @@ def init_dp_cpu_group_impl(vllm_config: VllmConfig, coord_store, group_type="nor
         group_name=_get_unique_name("dp_group"),
     )
     _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
-
-    get_dp_group().group_type = group_type
 
     for sock in listen_sockets:
         with contextlib.suppress(OSError):
