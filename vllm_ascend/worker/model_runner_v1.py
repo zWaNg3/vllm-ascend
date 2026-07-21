@@ -3506,3 +3506,9 @@ def update_pass_config(model_runner):
         yield
     finally:
         model_runner.compilation_config.pass_config.enable_sp = original_pass_config_sp
+
+
+# Apply fault injection patch for e2e testing (env-var gated, no-op in production).
+from vllm_ascend.patch.worker.patch_fault_injection import inject_fault
+
+inject_fault(NPUModelRunner)
