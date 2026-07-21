@@ -16,17 +16,16 @@
 #
 """Fault injection patch for fault tolerance e2e testing.
 
-This module wraps ``NPUModelRunner._sync_batch_across_dp`` to inject a
-simulated RuntimeError after a configurable number of all_reduce iterations
+This module monkey-patches ``NPUModelRunner._sync_batch_across_dp`` to inject
+a simulated RuntimeError after a configurable number of all_reduce iterations
 on a target dp_rank.  It is gated by environment variables and is a no-op
 when the variables are absent.
 
-Because the NPUModelRunner class is defined in ``model_runner_v1.py``, which
-triggers ``patch/worker/__init__.py`` during its own import (via a
-``patch_draft_quarot`` import), this module must **not** import
-``model_runner_v1`` at module level — that would create a circular import.
-Instead, ``model_runner_v1.py`` calls :func:`inject_fault` at the end of the
-file once the class is fully defined.
+Because ``patch/worker/__init__.py`` is loaded during ``model_runner_v1``'s
+own import (the class is not yet defined), this module must **not** be
+imported from ``__init__.py``.  Instead, :func:`inject_fault` is called from
+``patch_multiproc_executor.py`` after ``init_worker`` has fully resolved the
+worker class.
 
 Environment variables
 ---------------------
@@ -43,16 +42,18 @@ _INJECT_RANK = int(os.environ.get("VLLM_FAULT_INJECT_RANK", "0"))
 _counter = 0
 
 
-def inject_fault(cls):
-    """Replace cls._sync_batch_across_dp with a fault-injecting wrapper.
+def inject_fault():
+    """Replace NPUModelRunner._sync_batch_across_dp with a fault-injecting wrapper.
 
     Only applies the monkey-patch when ``VLLM_FAULT_INJECT_COUNT`` > 0.
-    Call this after the NPUModelRunner class is fully defined.
+    Call this after the NPUModelRunner class is fully imported.
     """
     if _INJECT_COUNT <= 0:
         return
 
-    _original = cls._sync_batch_across_dp
+    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+    _original = NPUModelRunner._sync_batch_across_dp
 
     def _patched(self, *args, **kwargs):
         global _counter
@@ -66,4 +67,4 @@ def inject_fault(cls):
             )
         return result
 
-    cls._sync_batch_across_dp = _patched
+    NPUModelRunner._sync_batch_across_dp = _patched

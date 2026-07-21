@@ -192,6 +192,13 @@ class AscendWorkerProc(WorkerProc):
         wrapper.init_worker(all_kwargs)
         self.worker = wrapper
 
+        # Apply fault injection for e2e testing (env-var gated, no-op in production).
+        # Must be called here — after init_worker has resolved and imported
+        # the NPUModelRunner class, but before load_model / busy_loop.
+        from vllm_ascend.patch.worker.patch_fault_injection import inject_fault  # noqa: E402
+
+        inject_fault()
+
         self.setup_proc_title_and_log_prefix(enable_ep=vllm_config.parallel_config.enable_expert_parallel)
 
         # Load model
