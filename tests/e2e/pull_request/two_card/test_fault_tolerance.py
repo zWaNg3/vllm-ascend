@@ -21,8 +21,11 @@ pauses, recovers (retry), or reconfigures (scale_down) when a real fault
 is injected during active inference on DP=2.
 """
 
+import json
+import os
 import threading
 import time
+from unittest.mock import patch
 
 import psutil
 import requests
@@ -84,15 +87,16 @@ def test_fault_tolerance_retry() -> None:
     server_args = [
         "--max_model_len", "1024",
         "--max_num_seqs", "8",
-        "--data-parallel-size", "2",
+        "--data-parallel-size", "4",
         "--enable-fault-tolerance",
-        "--gloo_timeout_seconds", "15",
+        "--gloo_timeout_seconds", "30",
         "--port", str(port),
     ]
 
     with RemoteOpenAIServer(
         model,
         server_args,
+        server_host="localhost",
         server_port=port,
         auto_port=False,
         env_dict=env_dict,
@@ -120,6 +124,8 @@ def test_fault_tolerance_retry() -> None:
         # Wait for the injected fault to pause both engines
         _wait_engine_status(server, 0, "paused", timeout=120)
         _wait_engine_status(server, 1, "paused", timeout=30)
+        _wait_engine_status(server, 2, "paused", timeout=30)
+        _wait_engine_status(server, 3, "paused", timeout=30)
 
         stop_flag.set()
         t.join(timeout=10)
@@ -144,6 +150,7 @@ def test_fault_tolerance_retry() -> None:
         assert resp.choices[0].text, "Inference should work after retry"
 
 
+@patch.dict(os.environ, {"HCCL_BUFFSIZE": "1024"})
 @wait_until_npu_memory_free()
 def test_fault_tolerance_scale_down() -> None:
     """E2E scale_down: kill worker 0 during inference then issue scale_down.
@@ -160,17 +167,24 @@ def test_fault_tolerance_scale_down() -> None:
 
     server_args = [
         "--max_model_len", "8192",
-        "--tensor_parallel_size", "1",
-        "--data-parallel-size", "2",
+        "--data-parallel-size", "4",
         "--enable-fault-tolerance",
         "--enable-expert-parallel",
         "--gloo_timeout_seconds", "30",
         "--port", str(port),
     ]
 
+    additional_config = {
+        "eplb_config": {
+            "num_redundant_experts": 48,
+        }
+    }
+    server_args.extend(["--additional-config", json.dumps(additional_config)])
+
     with RemoteOpenAIServer(
         model,
         server_args,
+        server_host="localhost",
         server_port=port,
         auto_port=False,
     ) as server:
@@ -193,20 +207,22 @@ def test_fault_tolerance_scale_down() -> None:
 
         t = threading.Thread(target=_run_inference, daemon=True)
         t.start()
-        time.sleep(5)
+        time.sleep(10)
 
         # Kill worker 0: match OS process name "VllmWorker-0"
         # (vllm multiproc_executor.py L672: name=f"VllmWorker-{rank}")
         vllm_proc = server.proc
         children = psutil.Process(vllm_proc.pid).children(recursive=True)
-        workers = [c for c in children if c.name().startswith("VllmWorker-")]
-        worker0 = next((c for c in workers if c.name() == "VllmWorker-0"), None)
-        assert worker0 is not None, "Could not find VllmWorker-0 process"
+        workers = [c for c in children if c.name().startswith("Vllm::Worker")]
+        worker0 = next((c for c in workers if c.name() == "Vllm::Worker_DP0_EP0"), None)
+        assert worker0 is not None, "Could not find VllmWorker_DP0_EP0 process"
         worker0.kill()
 
         # Wait for the fault to be detected and remaining engine to pause
         _wait_engine_status(server, 0, "dead", timeout=180)
         _wait_engine_status(server, 1, "paused", timeout=30)
+        _wait_engine_status(server, 2, "paused", timeout=30)
+        _wait_engine_status(server, 3, "paused", timeout=30)
 
         stop_flag.set()
         t.join(timeout=10)

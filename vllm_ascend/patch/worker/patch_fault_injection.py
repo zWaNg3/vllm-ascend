@@ -59,8 +59,7 @@ def inject_fault():
         global _counter
         result = _original(self, *args, **kwargs)
         _counter += 1
-        if _counter >= _INJECT_COUNT and self.dp_rank == _INJECT_RANK:
-            _counter = 0
+        if _counter == _INJECT_COUNT and self.dp_rank == _INJECT_RANK:
             raise RuntimeError(
                 f"Simulated fault injection: dp_rank={self.dp_rank} "
                 f"after {_INJECT_COUNT} all_reduce iterations"
