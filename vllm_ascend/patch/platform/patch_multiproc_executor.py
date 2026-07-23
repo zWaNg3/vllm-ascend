@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import weakref
 from collections import deque
 from collections.abc import Callable
@@ -191,14 +192,18 @@ class AscendWorkerProc(WorkerProc):
             # Have the worker close parent end of this worker's pipes too
             "inherited_fds": inherited_fds if inherited_fds is not None else [],
         }
+        daemon_mode = not (
+                    os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1")
+                    or os.getenv("EXPERT_MAP_RECORD", "false") == "true"
+                    or os.getenv("FAULT_EPLB_ENABLE","false").lower() in ("true", "1")
+                )
         # Run EngineCore busy loop in background process.
         proc = context.Process(
             target=WorkerProc.worker_main,
             kwargs=process_kwargs,
             name=f"VllmWorker-{rank}",
-            daemon=False,
+            daemon=daemon_mode,
         )
-
         proc.start()
         # Close child ends of pipes here in the parent
         ready_writer.close()

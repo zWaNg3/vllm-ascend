@@ -73,6 +73,7 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.sentinel.npu_worker_sentinel import WorkerSentinel
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -157,6 +158,8 @@ class NPUWorker(WorkerBase):
         if "UnquantizedLinearMethod" in WEIGHT_LOADER_V2_SUPPORTED:
             WEIGHT_LOADER_V2_SUPPORTED.remove("UnquantizedLinearMethod")
 
+        self.worker_sentinel: WorkerSentinel | None = None
+
         self.use_v2_model_runner = self.vllm_config.use_v2_model_runner
         if self.use_v2_model_runner and vllm_version_is("0.23.0"):
             logger.warning("VLLM_USE_V2_MODEL_RUNNER is not supported on vllm 0.23.0; falling back to v1 model runner.")
@@ -180,6 +183,10 @@ class NPUWorker(WorkerBase):
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
+
+    def handle_ft_command(self, ft_request):
+        assert self.worker_sentinel is not None
+        return self.worker_sentinel.handle_command(ft_request)
 
     def uninstall_static_kernel(self):
         import fcntl
@@ -393,12 +400,16 @@ class NPUWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def _init_device(self):
+        # vLLM v0.24.0 (PR #45026) removed automatic per-process device
+        # isolation for DP workers. Mirror gpu_worker.py::init_device:
+        # shift self.local_rank by dp_local_rank * tp_pp_world_size so
+        # that each DP group binds to a distinct set of NPUs.
+        parallel_config = self.parallel_config
+        if self.parallel_config.enable_fault_tolerance:
+            import torch_npu
+
+            torch_npu.npu.set_op_timeout_ms(get_ascend_config().operator_timeout_ms)
         if not vllm_version_is("0.23.0"):
-            # vLLM v0.24.0 (PR #45026) removed automatic per-process device
-            # isolation for DP workers. Mirror gpu_worker.py::init_device:
-            # shift self.local_rank by dp_local_rank * tp_pp_world_size so
-            # that each DP group binds to a distinct set of NPUs.
-            parallel_config = self.parallel_config
             if (
                 parallel_config.distributed_executor_backend not in ("ray", "external_launcher")
                 and parallel_config.data_parallel_backend != "ray"
@@ -495,6 +506,8 @@ class NPUWorker(WorkerBase):
 
         # Initialize the distributed environment.
         self._init_worker_distributed_environment()
+        if self.parallel_config.enable_fault_tolerance:
+            self.worker_sentinel = WorkerSentinel(worker=self, device=device)
         # Set random seed.
         set_random_seed(self.model_config.seed)
         # Initialize device properties used by triton kernels.

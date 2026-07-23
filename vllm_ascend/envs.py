@@ -110,6 +110,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Timeout in millseconds for operator execution on Ascend NPU.
+    # If an operator exceeds this timeout, an error will be raised.
+    # Deafult: 0 (no timeout). Set to a positive integer to enable timeout.
+    "VLLM_ASCEND_OPERATOR_TIMEOUT": lambda: int(os.getenv("VLLM_ASCEND_OPERATOR_TIMEOUT", "0")),
 }
 
 # end-env-vars-definition
