@@ -180,6 +180,12 @@ class AscendConfig:
             "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK",
             ascend_envs.VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK,
         )
+        self.operator_timeout_ms = self._get_config_value(
+            additional_config,
+            "operator_timeout_ms",
+            "VLLM_ASCEND_OPERATOR_TIMEOUT",
+            ascend_envs.VLLM_ASCEND_OPERATOR_TIMEOUT,
+        )
 
         self.pd_tp_ratio = 1
         self.pd_head_ratio = 1
