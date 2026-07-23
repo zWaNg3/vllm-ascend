@@ -491,13 +491,13 @@ class NPUModelRunner(GPUModelRunner):
         self.dynamic_eplb = eplb_config.dynamic_eplb
         self.eplb_enable = self.dynamic_eplb or (eplb_config.expert_map_path is not None)
         self.fault_tolerance = vllm_config.parallel_config.enable_fault_tolerance
-        if self.dynamic_eplb or self.fault_tolerance:
+        if self.dynamic_eplb:
             self.is_eplb_warmuped = False
             self.policy_type = eplb_config.eplb_policy_type
             self.eplb_loader = D2DExpertWeightLoader()
             self.manager = Manager()
             self.shared_dict = self.manager.dict(
-                {"expert_map": None, "moe_load": None, "expert_maps": None, "scale_down": False, "update_layer_id": -1})
+                {"expert_map": None, "moe_load": None, "expert_maps": None})
             self.eplb_process = EplbProcess(
                 shared_dict=self.shared_dict,
                 policy_type=self.policy_type,
