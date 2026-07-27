@@ -1694,6 +1694,26 @@ class NPUModelRunner(GPUModelRunner):
                 self.draft_token_ids_cpu[:num_reqs] = 0
             self.draft_token_ids_event.record()
 
+    @contextmanager
+    def synchronize_input_prep(self):
+        """Override to skip prepare_input_event synchronize/record after
+        a fault has been detected."""
+
+        if self.prepare_inputs_event is None:
+            yield
+            return
+
+        self.prepare_inputs_event.synchronize()
+        try:
+            yield
+        except:
+            raise RuntimeError(
+                    "prepare_inputs_event record skipped due to fault."
+                )
+        else:
+            self.prepare_inputs_event.record()
+
+
     @torch.inference_mode()
     def execute_model(
         self,
