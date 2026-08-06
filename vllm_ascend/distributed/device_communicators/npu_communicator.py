@@ -135,6 +135,9 @@ class _NpuAll2AllManager:
             )
         self._elastic_info.copy_(self._elastic_info_host, non_blocking=True)
 
+    def clean_buffers(self) -> None:
+        """No-op: NPU registers no RDMA buffers or all2all mask state."""
+
 
 class NPUCommunicator(DeviceCommunicatorBase):
     def __init__(
