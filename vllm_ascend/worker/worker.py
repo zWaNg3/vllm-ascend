@@ -61,7 +61,7 @@ from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
-from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.distributed.parallel_state import ElasticInfoMask, init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
@@ -163,6 +163,9 @@ class NPUWorker(WorkerBase):
         self.use_v2_model_runner = self.vllm_config.use_v2_model_runner
         self._pp_send_work: list[Handle] = []
 
+        # Fault-tolerance state: the Ascend EP-rank mask (elastic_info) consumed
+        # by the MC2 kernel. Built in ``_init_device`` once the NPU is known.
+        self.elastic_info_mask: ElasticInfoMask | None = None
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
         if ascend_compilation_config.enable_npugraph_ex and ascend_compilation_config.enable_static_kernel:
             # Prevent duplicate triggers, execute the exit logic only once
@@ -184,6 +187,31 @@ class NPUWorker(WorkerBase):
     def handle_ft_command(self, ft_request):
         assert self.worker_sentinel is not None
         return self.worker_sentinel.handle_command(ft_request)
+
+    def _init_elastic_info_mask(self, device: torch.device) -> None:
+        """Build the Ascend EP-rank mask (elastic_info) on the current device.
+
+        The MC2 EP world size and the physical expert count (logical +
+        redundant) are config-derived; the elastic_info tensor must live on the
+        current NPU device.
+        """
+        hf_config = self.model_config.hf_config
+        if hasattr(hf_config, "num_experts"):
+            num_logical_expert = int(hf_config.num_experts)
+        elif hasattr(hf_config, "n_routed_experts"):
+            num_logical_expert = int(hf_config.n_routed_experts)
+        else:
+            raise ValueError("unknown number of experts")
+
+        eplb_config = get_ascend_config().eplb_config
+        num_redundant = int(eplb_config.num_redundant_experts or 0)
+        ep_size = (
+            self.parallel_config.data_parallel_size
+            * self.parallel_config.prefill_context_parallel_size
+            * self.parallel_config.tensor_parallel_size
+        )
+        num_physical_experts = num_logical_expert + num_redundant
+        self.elastic_info_mask = ElasticInfoMask(ep_size, num_physical_experts, device=device)
 
     def uninstall_static_kernel(self):
         import fcntl
@@ -502,6 +530,7 @@ class NPUWorker(WorkerBase):
         # Initialize the distributed environment.
         self._init_worker_distributed_environment()
         if self.parallel_config.enable_fault_tolerance:
+            self._init_elastic_info_mask(device)
             self.worker_sentinel = WorkerSentinel(worker=self, device=device)
         # Set random seed.
         set_random_seed(self.model_config.seed)
