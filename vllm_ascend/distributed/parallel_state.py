@@ -7,6 +7,15 @@ from vllm_ascend.ascend_config import get_ascend_config
 # Currently, mc2 op need their own group coordinator.
 _MC2: GroupCoordinator | None = None
 
+# Fault-tolerance elastic_info consumed by the MC2 token-dispatch kernel. See
+# `ElasticInfoMask` below for the layout and the mask semantics it encodes.
+_ELASTIC_INFO: torch.Tensor | None = None
+
+# The process-wide ElasticInfoMask instance (one per worker, created by
+# `NPUWorker._init_elastic_info_mask`). Consumed by `_NpuAll2AllManager` so the
+# FT sentinel can go through `get_ep_all2all_manager()` like the GPU path.
+_ACTIVE_ELASTIC_INFO_MASK: "ElasticInfoMask | None" = None
+
 # Module specific tensor parallel groups
 _MLP_TP: GroupCoordinator | None = None
 _OTP: GroupCoordinator | None = None
@@ -136,6 +145,130 @@ def init_ascend_model_parallel(
 
 def model_parallel_initialized():
     return _MC2 is not None
+
+
+def get_elastic_info() -> torch.Tensor | None:
+    """Return the elastic_info tensor consumed by the MC2 token-dispatch kernel.
+
+    ``None`` means fault tolerance is disabled and no elastic_info is passed to
+    the dispatch op. Once initialized (see `ElasticInfoMask`), the tensor is
+    updated in place so the kernel always observes the latest dead-rank set.
+    """
+    return _ELASTIC_INFO
+
+
+def set_elastic_info(elastic_info: torch.Tensor | None) -> None:
+    """Set the module-level elastic_info tensor.
+
+    On subsequent calls the new value is copied into the existing storage so
+    that buffers referencing the tensor (e.g. captured in the dispatcher) stay
+    valid.
+    """
+    global _ELASTIC_INFO
+    if _ELASTIC_INFO is None or elastic_info is None:
+        _ELASTIC_INFO = elastic_info
+    else:
+        assert _ELASTIC_INFO.shape == elastic_info.shape
+        _ELASTIC_INFO.copy_(elastic_info)
+
+
+def get_active_elastic_info_mask() -> "ElasticInfoMask | None":
+    """Return the process-wide ElasticInfoMask instance.
+
+    ``None`` means fault tolerance is disabled (or the worker's FT state has
+    not been set up yet). Consumed by ``_NpuAll2AllManager`` so the FT sentinel
+    can use ``get_ep_all2all_manager().update_mask(...)`` / ``query_fault()``
+    like the GPU path.
+    """
+    return _ACTIVE_ELASTIC_INFO_MASK
+
+
+class ElasticInfoMask:
+    """Ascend equivalent of the all2all rank mask used in upstream fault
+    tolerance.
+
+    Upstream ``WorkerSentinel.scale_down`` masks dead EP ranks on the all2all
+    manager (``mgr.update_mask(ep_rank, masked=True)``). Ascend's MC2 kernel has
+    no such mask query, so the dead ranks are encoded in an ``elastic_info``
+    tensor consumed by ``npu_moe_distribute_dispatch``. This class exposes the
+    same ``update_mask`` / ``query_active_mask`` semantics on top of
+    elastic_info so the NPU scale-down flow reads like PR #46370.
+
+    Tensor layout (kept identical to the hardware-validated demo branch):
+        ``[is_scaled_down, scaled_down_ep_size, share_expert_rank_num,
+        num_physical_experts] + table1(ep_size) + table2(ep_size)``
+
+    - ``table1[ep_rank]``: local (densified) EP rank after scale-down, ``-1``
+      for dead ranks
+    - ``table2[local_ep_rank]``: original EP rank of that local slot, ``-1``
+      for invalid slots
+
+    The surviving EP ranks are DENSIFIED (renumbered 0..k-1 with no holes),
+    matching the MC2 kernel's expected elastic_info semantics (the demo
+    branch). The EP device group itself keeps its original world size; only
+    the kernel's rank mapping is compacted.
+    """
+
+    def __init__(
+        self,
+        ep_size: int,
+        num_physical_experts: int,
+        share_expert_rank_num: int = 0,
+        device: torch.device | None = None,
+    ) -> None:
+        self.ep_size = ep_size
+        self.num_physical_experts = num_physical_experts
+        self.share_expert_rank_num = share_expert_rank_num
+        self.device = device if device is not None else torch.device("cpu")
+        self._masked: set[int] = set()
+        global _ACTIVE_ELASTIC_INFO_MASK
+        _ACTIVE_ELASTIC_INFO_MASK = self
+        self._build()
+
+    def update_mask(self, ep_rank: int, masked: bool = True) -> None:
+        """Mark an EP rank as dead (``masked=True``) or alive again."""
+        if masked:
+            self._masked.add(ep_rank)
+        else:
+            self._masked.discard(ep_rank)
+        self._build()
+
+    def set_num_physical_experts(self, num_physical_experts: int) -> None:
+        """Update the physical-expert count (shrinks after scale-down).
+
+        Mirrors the demo branch's ``update_elastic_info``, which passes the
+        reduced ``num_new_phy_experts`` so the kernel's expert space matches the
+        surviving ranks.
+        """
+        self.num_physical_experts = num_physical_experts
+        self._build()
+
+    def query_active_mask(self) -> list[int]:
+        """Return a per-EP-rank mask (1 = alive, 0 = dead)."""
+        return [0 if rank in self._masked else 1 for rank in range(self.ep_size)]
+
+    def _build(self) -> None:
+        is_scaled_down = 1 if self._masked else 0
+        valid = [rank for rank in range(self.ep_size) if rank not in self._masked]
+        scaled_down_ep_size = len(valid)
+        base_config = torch.tensor(
+            [is_scaled_down, scaled_down_ep_size, self.share_expert_rank_num, self.num_physical_experts],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        # Densified mapping over the surviving ranks (matches the
+        # hardware-validated demo branch): the MC2 kernel expects the surviving
+        # EP ranks to be renumbered 0..k-1 (no holes), with dead ranks at -1.
+        # table1[ep_rank] = local (densified) EP rank, -1 for dead ranks.
+        table1 = torch.full((self.ep_size,), -1, dtype=torch.int32, device=self.device)
+        for local, ep in enumerate(valid):
+            table1[ep] = local
+        # table2[local_ep_rank] = original EP rank, -1 for invalid slots.
+        table2 = torch.full((self.ep_size,), -1, dtype=torch.int32, device=self.device)
+        for local, ep in enumerate(valid):
+            table2[local] = ep
+        elastic_info = torch.cat([base_config, table1, table2], dim=0).to(torch.int32)
+        set_elastic_info(elastic_info)
 
 
 def get_mc2_group() -> GroupCoordinator:

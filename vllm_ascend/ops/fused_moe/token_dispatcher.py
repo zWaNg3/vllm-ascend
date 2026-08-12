@@ -31,7 +31,7 @@ from vllm.distributed.parallel_state import get_ep_group
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import get_mc2_tokens_capacity
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.distributed.parallel_state import get_mc2_group
+from vllm_ascend.distributed.parallel_state import get_elastic_info, get_mc2_group
 from vllm_ascend.lora.fused_moe import (
     all2all_lora_indices,
     postprocess_lora_indices,
@@ -121,6 +121,9 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         self.enable_dispatch_v2 = hasattr(torch_npu, "npu_moe_distribute_dispatch_v2")
         self.need_extra_args = get_ascend_device_type() in [AscendDeviceType.A3, AscendDeviceType.A5]
         self.a5_need_extra_args = get_ascend_device_type() == AscendDeviceType.A5
+        # FT rank mask (elastic_info), refreshed per dispatch call; shared with
+        # the combine operator. None when fault tolerance is disabled.
+        self.elastic_info: torch.Tensor | None = None
         # NOTE: When in A2, setting the environment variables HCCL_INTRA_PCIE_ENABLE=1 and
         # HCCL_INTRA_ROCE_ENABLE=0 can reduce cross-machine communication traffic and significantly
         # improve communication performance.
@@ -195,6 +198,13 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         }
         if self.global_bs == 0:
             kwargs_mc2["x_active_mask"] = token_dispatch_input.routing.mc2_mask
+        # Fault tolerance: the elastic_info tensor carries the EP-rank mask
+        # (dead ranks set to -1 in the rank tables) consumed by the MC2 kernel.
+        # It is refreshed per call in ``token_dispatch`` and passed to BOTH the
+        # dispatch and the combine operators (the combine's alltoallv also spans
+        # the EP group and must exclude dead ranks).
+        if self.elastic_info is not None:
+            kwargs_mc2["elastic_info"] = self.elastic_info
 
         stage1_kwargs = {
             "scales": None,
@@ -240,6 +250,9 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         self,
         token_dispatch_input: MoETokenDispatchInput,
     ):
+        # Refresh the FT rank mask once per call; the combine operator (run
+        # right after the MLP) reuses the same value.
+        self.elastic_info = get_elastic_info()
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)
         output = (
             torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
@@ -307,6 +320,12 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         }
         if self.global_bs == 0:
             kwargs_mc2["x_active_mask"] = combine_metadata.mc2_mask
+        # The combine operator's alltoallv also spans the EP group; pass the
+        # FT rank mask (set by token_dispatch) so dead ranks are excluded.
+        if self.elastic_info is not None:
+            kwargs_mc2["elastic_info"] = self.elastic_info
+        elif get_elastic_info() is not None:
+            kwargs_mc2["elastic_info"] = get_elastic_info()
 
         if combine_metadata.quant.dispatch_with_quant:
             tp_recv_counts = torch.empty(1, dtype=torch.int32, device=hidden_states.device)
