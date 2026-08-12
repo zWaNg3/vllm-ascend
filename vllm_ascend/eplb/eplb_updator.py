@@ -38,6 +38,10 @@ class EplbUpdator:
         self.eplb_process = eplb_process
         self.shared_dict = self.eplb_process.shared_dict
         self.comm_group = get_dynamic_eplb_group()
+        # Set during fault-tolerance scale-down: stop the cross-rank all_gather
+        # and d2d weight updates, which would hang on the dead ranks. Mirrors
+        # the demo branch's ``eep_eplb_suppressed`` (dynamic_eplb stays on).
+        self.eep_eplb_suppressed = False
 
     def set_adaptor(self, adaptor: VllmEplbAdaptor):
         self.pp_rank = get_pp_group().rank_in_group
@@ -104,6 +108,8 @@ class EplbUpdator:
         self.eplb_process.planner_q.put(1)
 
     def forward_before(self):
+        if self.eep_eplb_suppressed:
+            return
         # Batch after eplb process being triggered, get update info provided by eplb process
         if self.get_update_info_flag():
             self.update_info_all = self.eplb_process.block_update_q.get()
@@ -127,6 +133,8 @@ class EplbUpdator:
                 self.eplb_loader.asyn_expert_weight_transfer(self.reqs)
 
     def forward_end(self, eplb_heat_collection_status: bool = True):
+        if self.eep_eplb_suppressed:
+            return
         if self.wakeup_eplb_worker_flag():
             with record_function_or_nullcontext("EPLB gather moe load"):
                 self.compute_and_set_moe_load()
