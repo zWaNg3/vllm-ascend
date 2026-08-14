@@ -13,7 +13,6 @@ from vllm_ascend.distributed.parallel_state import get_active_elastic_info_mask,
 from vllm_ascend.worker.sentinel.eplb_redistribute import (
     compute_dead_ep_ranks,
     rebuild_model_expert_maps,
-    reconfigure_moe,
     redistribute_expert_placement,
     reload_experts_from_disk,
 )
@@ -110,36 +109,10 @@ class WorkerSentinel(GPUWorkerSentinel):
         ep_rank = get_mc2_group().rank_in_group
         tp_size = self.worker.parallel_config.tensor_parallel_size
         layers = self._get_moe_layers()
-
-        # [FT][diag] Dump the placement redundancy before redistribution so a
-        # "not enough redundant slots" failure can be diagnosed.
-        for layer_id, layer in enumerate(layers):
-            gem = layer.global_expert_map
-            if gem is None:
-                continue
-            n_logical = gem.shape[1]
-            total_slots = int((gem != -1).sum().item())
-            distinct = int((gem != -1).any(dim=0).sum().item())
-            per_rank = (gem != -1).sum(dim=1).tolist()
-            logger.warning(
-                "[FT][diag] layer=%d n_logical=%d per_rank_slots=%s total_slots=%d "
-                "distinct_logicals=%d duplicate_copies=%d "
-                "global_redundant_expert_num=%s dead_ep_ranks=%s",
-                layer_id,
-                n_logical,
-                per_rank,
-                total_slots,
-                distinct,
-                total_slots - distinct,
-                getattr(layer, "global_redundant_expert_num", None),
-                sorted(dead_ep_ranks),
-            )
-
         new_expert_maps = []
         # layer_id -> all local logical experts (needed by the disk reload so
         # the affected layer can be re-processed from raw).
         reload_set: dict[int, list[int]] = {}
-        new_num_physical: int | None = None
         for layer_id, layer in enumerate(layers):
             if getattr(layer, "global_expert_map", None) is None:
                 raise RuntimeError(
@@ -147,18 +120,13 @@ class WorkerSentinel(GPUWorkerSentinel):
                     "(global_expert_map is None). Set num_redundant_experts > 0 "
                     "and enable dynamic EPLB."
                 )
-            num_local = int(layer.moe_config.num_local_experts)
-            num_logical = int(layer.global_expert_map.shape[1])
-            new_map, log2phy, reassignments, new_num_physical = redistribute_expert_placement(
+            new_map, log2phy, reassignments = redistribute_expert_placement(
                 layer.global_expert_map,
                 dead_ep_ranks,
                 ep_rank,
                 tp_size=tp_size,
             )
             rebuild_model_expert_maps(layer, new_map, ep_rank, log2phy)
-            # Shrink the physical-expert counts to the surviving slots (demo
-            # reconfigure_moe), so moe_expert_num matches elastic_info.
-            reconfigure_moe(layer, num_logical, new_num_physical, num_local)
             if reassignments:
                 local_row = new_map[ep_rank]
                 reload_set[layer_id] = [int(exp) for exp in local_row.tolist() if exp >= 0]
@@ -178,17 +146,11 @@ class WorkerSentinel(GPUWorkerSentinel):
                 reload_set,
             )
 
-        # elastic_info's num_physical_experts shrinks to the surviving slots.
-        mask = getattr(self.worker, "elastic_info_mask", None)
-        if mask is not None and new_num_physical is not None:
-            mask.set_num_physical_experts(new_num_physical)
-
         logger.info(
-            "[FT] Expert redistribution: ep_rank=%d, dead_ep_ranks=%s, reload_layers=%s, new_num_physical=%s",
+            "[FT] Expert redistribution: ep_rank=%d, dead_ep_ranks=%s, reload_layers=%s",
             ep_rank,
             sorted(dead_ep_ranks),
             sorted(reload_set),
-            new_num_physical,
         )
 
     def scale_down(self, ft_request: FaultToleranceRequest):

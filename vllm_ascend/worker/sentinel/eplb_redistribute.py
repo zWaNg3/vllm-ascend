@@ -66,14 +66,14 @@ def redistribute_expert_placement(
     dead_ep_ranks: set[int],
     ep_rank: int,
     tp_size: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, list[tuple[int, int]], int]:
+) -> tuple[torch.Tensor, torch.Tensor, list[tuple[int, int]]]:
     """Deterministically re-host dead ranks' experts on surviving ranks.
 
-    The EP device group keeps its original world size, but the surviving ranks
-    are renumbered 0..k-1 (densified) so the MC2 kernel's elastic_info mapping
-    applies. Dead ranks' slots are vacated; each logical expert whose only copy
-    lived on a dead rank is moved into a free (redundant) slot on a surviving
-    rank.
+    The EP topology is unchanged (ranks are NOT rearranged, matching
+    vllm-project/vllm PR #46370): every surviving rank keeps its EP rank id and
+    its ``num_local`` physical slots. Dead ranks' slots are vacated; each
+    logical expert whose only copy lived on a dead rank is moved into a free
+    (redundant) slot on a surviving rank.
 
     Args:
         global_expert_map: ``[ep_size, n_logical]`` logical->slot map.
@@ -83,12 +83,12 @@ def redistribute_expert_placement(
             expert still has multiple surviving copies.
 
     Returns:
-        ``(new_global_expert_map, log2phy, reassignments, new_num_physical)``:
-        the updated ``[ep_size, n_logical]`` map, this rank's ``[n_logical]``
-        logical->global-physical map (with densified physical ids), a
-        ``[(local_slot, logical_expert)]`` list of slots whose hosted expert
-        changed (needs a weight reload), and the number of physical experts
-        after scale-down (``(ep_size - len(dead)) * num_local``).
+        ``(new_global_expert_map, log2phy, reassignments)`` where
+        ``new_global_expert_map`` is the updated ``[ep_size, n_logical]`` map,
+        ``log2phy`` is this rank's ``[n_logical]`` logical->global-physical map
+        and ``reassignments`` is a ``[(local_slot, logical_expert)]`` list of
+        every slot on this rank whose hosted expert changed (needs a weight
+        reload).
     """
     placement = global_placement(global_expert_map)
     ep_size, num_local = placement.shape
@@ -120,12 +120,9 @@ def redistribute_expert_placement(
     free_slots.sort()
 
     if len(free_slots) < len(orphaned):
-        per_rank = {rank: int((placement[rank] != -1).sum().item()) for rank in range(ep_size)}
         raise RuntimeError(
             f"[FT] Not enough redundant slots to scale down: "
-            f"{len(free_slots)} free slots < {len(orphaned)} orphaned experts. "
-            f"per_rank_slots={per_rank} num_local={num_local} "
-            f"dead_ep_ranks={sorted(dead_ep_ranks)}"
+            f"{len(free_slots)} free slots < {len(orphaned)} orphaned experts."
         )
 
     new_placement = placement.clone()
@@ -144,9 +141,8 @@ def redistribute_expert_placement(
             if logical >= 0:
                 new_global_expert_map[rank, logical] = slot
 
-    new_num_physical = (ep_size - len(dead_ep_ranks)) * num_local
-    log2phy = generate_log2phy_map(new_global_expert_map, ep_rank, num_local, tp_size, dead_ep_ranks)
-    return new_global_expert_map, log2phy, sorted(reassignments_all.get(ep_rank, [])), new_num_physical
+    log2phy = generate_log2phy_map(new_global_expert_map, ep_rank, num_local, tp_size)
+    return new_global_expert_map, log2phy, sorted(reassignments_all.get(ep_rank, []))
 
 
 def generate_log2phy_map(
@@ -154,43 +150,33 @@ def generate_log2phy_map(
     ep_rank: int,
     num_local: int,
     tp_size: int | None = None,
-    dead_ep_ranks: set[int] = frozenset(),
 ) -> torch.Tensor:
     """Build the logical->global-physical map for ``ep_rank``.
 
-    The global physical expert id uses the **densified** surviving-rank index
-    (``local_rank * num_local + slot``, where ``local_rank`` renumbers the
-    surviving EP ranks 0..k-1 with no holes). This keeps ``expert_ids`` inside
-    ``[0, (ep_size - len(dead)) * num_local)`` and matches the elastic_info
-    ``table1`` mapping the MC2 kernel expects after scale-down. Weights stay at
-    their per-rank local slots; only the global physical id numbering changes.
+    The global physical expert id is ``rank * num_local + slot`` (the flattened
+    ``[ep_size, num_local]`` weight layout). When a logical expert still has
+    several surviving copies the replica is chosen deterministically, mirroring
+    ``vllm_ascend.eplb.core.eplb_utils.generate_log2phy_map`` (but robust to a
+    dead rank 0, whose all-``-1`` row would otherwise zero out ``valid_count``).
     """
-
-    def _local_rank(rank: int) -> int:
-        return rank - sum(1 for d in dead_ep_ranks if d < rank)
-
     n_logical = global_expert_map.shape[1]
     logical_to_phy: dict[int, list[int]] = defaultdict(list)
     for rank in range(global_expert_map.shape[0]):
-        if rank in dead_ep_ranks:
-            continue
-        local_rank = _local_rank(rank)
         row = global_expert_map[rank]
         for logical in range(n_logical):
             slot = int(row[logical].item())
             if slot >= 0:
-                logical_to_phy[logical].append(local_rank * num_local + slot)
+                logical_to_phy[logical].append(rank * num_local + slot)
 
     log2phy = torch.full((n_logical,), -1, dtype=torch.int32)
-    local_ep_rank = _local_rank(ep_rank)
     for logical, phy_ids in logical_to_phy.items():
         num_duplications = len(phy_ids)
         if tp_size is not None and tp_size > 1:
-            tp_rank = local_ep_rank % tp_size
-            dp_like_rank = local_ep_rank // tp_size
+            tp_rank = ep_rank % tp_size
+            dp_like_rank = ep_rank // tp_size
             replica_index = (tp_rank + dp_like_rank + logical) % num_duplications
         else:
-            replica_index = local_ep_rank % num_duplications
+            replica_index = ep_rank % num_duplications
         log2phy[logical] = phy_ids[replica_index]
     return log2phy
 
@@ -224,35 +210,6 @@ def rebuild_model_expert_maps(
     layer.routed_experts.expert_map_manager._expert_map = phys_map
     if layer.log2phy is not None:
         layer.log2phy.copy_(log2phy.to(layer.log2phy.device))
-
-
-def reconfigure_moe(
-    layer: "AscendMoERunner",
-    num_logical_experts: int,
-    new_num_physical: int,
-    num_local: int,
-) -> None:
-    """Update a MoE layer's expert counts after scale-down.
-
-    Mirrors the demo branch's ``reconfigure_moe``: after scale-down the number
-    of physical experts shrinks to the surviving slots, so the per-layer counts
-    (and the global redundant count) are refreshed. This keeps the MC2
-    dispatch's ``moe_expert_num`` (= num_logical + global_redundant_expert_num)
-    in agreement with elastic_info's ``num_physical_experts``.
-    """
-    new_redundant = new_num_physical - num_logical_experts
-    layer.global_redundant_expert_num = new_redundant
-    layer.moe_config.num_experts = new_num_physical
-    layer.moe_config.num_local_experts = num_local
-    layer.moe_config.num_logical_experts = num_logical_experts
-    layer.moe_config.global_redundant_expert_num = new_redundant
-    logger.info(
-        "[FT] reconfigure_moe: num_logical=%d, new_num_physical=%d, new_redundant=%d, num_local=%d",
-        num_logical_experts,
-        new_num_physical,
-        new_redundant,
-        num_local,
-    )
 
 
 def reload_experts_from_disk(
