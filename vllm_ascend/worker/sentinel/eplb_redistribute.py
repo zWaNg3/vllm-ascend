@@ -212,6 +212,35 @@ def rebuild_model_expert_maps(
         layer.log2phy.copy_(log2phy.to(layer.log2phy.device))
 
 
+def reconfigure_moe(
+    layer: "AscendMoERunner",
+    num_logical_experts: int,
+    new_num_physical: int,
+    num_local: int,
+) -> None:
+    """Update a MoE layer's expert counts after scale-down.
+
+    Mirrors the demo branch's ``reconfigure_moe``: after scale-down the number
+    of physical experts shrinks to the surviving slots, so the per-layer counts
+    (and the global redundant count) are refreshed. This keeps the MC2
+    dispatch's ``moe_expert_num`` (= num_logical + global_redundant_expert_num)
+    in agreement with elastic_info's ``num_physical_experts``.
+    """
+    new_redundant = new_num_physical - num_logical_experts
+    layer.global_redundant_expert_num = new_redundant
+    layer.moe_config.num_experts = new_num_physical
+    layer.moe_config.num_local_experts = num_local
+    layer.moe_config.num_logical_experts = num_logical_experts
+    layer.moe_config.global_redundant_expert_num = new_redundant
+    logger.info(
+        "[FT] reconfigure_moe: num_logical=%d, new_num_physical=%d, new_redundant=%d, num_local=%d",
+        num_logical_experts,
+        new_num_physical,
+        new_redundant,
+        num_local,
+    )
+
+
 def reload_experts_from_disk(
     model: torch.nn.Module,
     vllm_config,

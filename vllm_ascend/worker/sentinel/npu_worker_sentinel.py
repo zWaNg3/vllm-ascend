@@ -13,6 +13,7 @@ from vllm_ascend.distributed.parallel_state import get_active_elastic_info_mask,
 from vllm_ascend.worker.sentinel.eplb_redistribute import (
     compute_dead_ep_ranks,
     rebuild_model_expert_maps,
+    reconfigure_moe,
     redistribute_expert_placement,
     reload_experts_from_disk,
 )
@@ -120,6 +121,8 @@ class WorkerSentinel(GPUWorkerSentinel):
                     "(global_expert_map is None). Set num_redundant_experts > 0 "
                     "and enable dynamic EPLB."
                 )
+            num_local = int(layer.moe_config.num_local_experts)
+            num_logical = int(layer.global_expert_map.shape[1])
             new_map, log2phy, reassignments = redistribute_expert_placement(
                 layer.global_expert_map,
                 dead_ep_ranks,
@@ -127,6 +130,10 @@ class WorkerSentinel(GPUWorkerSentinel):
                 tp_size=tp_size,
             )
             rebuild_model_expert_maps(layer, new_map, ep_rank, log2phy)
+            # Shrink the physical-expert counts to the surviving slots so the
+            # MC2 dispatch's moe_expert_num agrees with elastic_info.
+            new_num_physical = (layer.global_expert_map.shape[0] - len(dead_ep_ranks)) * num_local
+            reconfigure_moe(layer, num_logical, new_num_physical, num_local)
             if reassignments:
                 local_row = new_map[ep_rank]
                 reload_set[layer_id] = [int(exp) for exp in local_row.tolist() if exp >= 0]
