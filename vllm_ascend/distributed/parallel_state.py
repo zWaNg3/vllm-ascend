@@ -235,23 +235,24 @@ class ElasticInfoMask:
 
     def _build(self) -> None:
         is_scaled_down = 1 if self._masked else 0
-        scaled_down_ep_size = self.ep_size - len(self._masked)
+        valid = [rank for rank in range(self.ep_size) if rank not in self._masked]
+        scaled_down_ep_size = len(valid)
         base_config = torch.tensor(
             [is_scaled_down, scaled_down_ep_size, self.share_expert_rank_num, self.num_physical_experts],
             dtype=torch.int32,
             device=self.device,
         )
-        # Identity mapping over surviving ranks (rank 不重排), -1 for dead ranks.
-        table1 = torch.tensor(
-            [rank if rank not in self._masked else -1 for rank in range(self.ep_size)],
-            dtype=torch.int32,
-            device=self.device,
-        )
-        table2 = torch.tensor(
-            [rank if rank not in self._masked else -1 for rank in range(self.ep_size)],
-            dtype=torch.int32,
-            device=self.device,
-        )
+        # Densified mapping over the surviving ranks (matches the
+        # hardware-validated demo branch / doc example): the MC2 kernel expects
+        # the surviving EP ranks to be renumbered 0..k-1 (no holes), with dead
+        # ranks at -1. table1[ep_rank] = local (densified) rank; table2[local]
+        # = original EP rank.
+        table1 = torch.full((self.ep_size,), -1, dtype=torch.int32, device=self.device)
+        for local, ep in enumerate(valid):
+            table1[ep] = local
+        table2 = torch.full((self.ep_size,), -1, dtype=torch.int32, device=self.device)
+        for local, ep in enumerate(valid):
+            table2[local] = ep
         elastic_info = torch.cat([base_config, table1, table2], dim=0).to(torch.int32)
         set_elastic_info(elastic_info)
 
