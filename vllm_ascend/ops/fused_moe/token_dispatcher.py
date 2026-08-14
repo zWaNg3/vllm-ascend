@@ -313,6 +313,11 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         }
         if self.global_bs == 0:
             kwargs_mc2["x_active_mask"] = combine_metadata.mc2_mask
+        # The combine operator's alltoallv also spans the EP group; pass the
+        # FT rank mask so dead ranks are excluded here too.
+        elastic_info = get_elastic_info()
+        if elastic_info is not None:
+            kwargs_mc2["elastic_info"] = elastic_info
 
         if combine_metadata.quant.dispatch_with_quant:
             tp_recv_counts = torch.empty(1, dtype=torch.int32, device=hidden_states.device)
