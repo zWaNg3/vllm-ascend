@@ -51,9 +51,7 @@ def global_placement(global_expert_map: torch.Tensor) -> torch.Tensor:
     """
     ep_size, n_logical = global_expert_map.shape
     num_local = int(global_expert_map.max().item()) + 1 if n_logical > 0 else 0
-    placement = torch.full(
-        (ep_size, num_local), -1, dtype=torch.int32, device=global_expert_map.device
-    )
+    placement = torch.full((ep_size, num_local), -1, dtype=torch.int32, device=global_expert_map.device)
     for rank in range(ep_size):
         row = global_expert_map[rank]
         valid = (row >= 0) & (row < num_local)
@@ -276,7 +274,6 @@ def reload_experts_from_disk(
         return 0
 
     import torch_npu
-
     from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
     from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ

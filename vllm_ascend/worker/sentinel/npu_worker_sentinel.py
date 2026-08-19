@@ -209,6 +209,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         model_runner.dp_size = dp_group_size
 
         from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+
         mgr = get_ep_all2all_manager()
         for ep_rank in sorted(dead_ep_ranks):
             mgr.update_mask(ep_rank, masked=True)
