@@ -1088,7 +1088,15 @@ class NPUWorker(WorkerBase):
 
     def execute_dummy_batch(self) -> None:
         self.log_memory_stats()
-        num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
+        # v2 runner keeps decode_query_len; uniform_decode_query_len is the v1
+        # name. Using the v1 name on the v2 runner falls back to 1 and makes the
+        # dummy batch (bumped to decode_query_len by _dummy_run's uniform_decode
+        # path) disagree with the DP-synced num_tokens.
+        num_tokens = getattr(
+            self.model_runner,
+            "decode_query_len",
+            getattr(self.model_runner, "uniform_decode_query_len", 1),
+        )
         # TODO(FT-DEBUG): remove after diagnosing DP-metadata mismatch after scale-down.
         from vllm.distributed import get_dp_group
 
