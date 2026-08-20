@@ -7,13 +7,12 @@ from vllm_ascend.ascend_config import get_ascend_config
 # Currently, mc2 op need their own group coordinator.
 _MC2: GroupCoordinator | None = None
 
-# Fault-tolerance elastic_info consumed by the MC2 token-dispatch kernel. See
-# `ElasticInfoMask` below for the layout and the mask semantics it encodes.
-_ELASTIC_INFO: torch.Tensor | None = None
-
 # The process-wide ElasticInfoMask instance (one per worker, created by
-# `NPUWorker._init_elastic_info_mask`). Consumed by `_NpuAll2AllManager` so the
-# FT sentinel can go through `get_ep_all2all_manager()` like the GPU path.
+# `NPUWorker._init_elastic_info_mask`). It owns both the FT mask state and the
+# derived elastic_info tensor consumed by the MC2 token-dispatch kernel. See
+# `ElasticInfoMask` below for the layout and the mask semantics it encodes.
+# Consumed by `_NpuAll2AllManager` so the FT sentinel can go through
+# `get_ep_all2all_manager()`.
 _ACTIVE_ELASTIC_INFO_MASK: "ElasticInfoMask | None" = None
 
 # Module specific tensor parallel groups
@@ -151,25 +150,12 @@ def get_elastic_info() -> torch.Tensor | None:
     """Return the elastic_info tensor consumed by the MC2 token-dispatch kernel.
 
     ``None`` means fault tolerance is disabled and no elastic_info is passed to
-    the dispatch op. Once initialized (see `ElasticInfoMask`), the tensor is
-    updated in place so the kernel always observes the latest dead-rank set.
+    the dispatch op. The tensor is owned by ``ElasticInfoMask`` and rebuilt in
+    place on every mask update, so the kernel always observes the latest
+    dead-rank set.
     """
-    return _ELASTIC_INFO
-
-
-def set_elastic_info(elastic_info: torch.Tensor | None) -> None:
-    """Set the module-level elastic_info tensor.
-
-    On subsequent calls the new value is copied into the existing storage so
-    that buffers referencing the tensor (e.g. captured in the dispatcher) stay
-    valid.
-    """
-    global _ELASTIC_INFO
-    if _ELASTIC_INFO is None or elastic_info is None:
-        _ELASTIC_INFO = elastic_info
-    else:
-        assert _ELASTIC_INFO.shape == elastic_info.shape
-        _ELASTIC_INFO.copy_(elastic_info)
+    mask = _ACTIVE_ELASTIC_INFO_MASK
+    return mask.elastic_info if mask is not None else None
 
 
 def get_active_elastic_info_mask() -> "ElasticInfoMask | None":
@@ -177,8 +163,7 @@ def get_active_elastic_info_mask() -> "ElasticInfoMask | None":
 
     ``None`` means fault tolerance is disabled (or the worker's FT state has
     not been set up yet). Consumed by ``_NpuAll2AllManager`` so the FT sentinel
-    can use ``get_ep_all2all_manager().update_mask(...)`` / ``query_fault()``
-    like the GPU path.
+    can use ``get_ep_all2all_manager().update_mask(...)`` / ``query_fault()``.
     """
     return _ACTIVE_ELASTIC_INFO_MASK
 
@@ -220,6 +205,9 @@ class ElasticInfoMask:
         self.share_expert_rank_num = share_expert_rank_num
         self.device = device if device is not None else torch.device("cpu")
         self._masked: set[int] = set()
+        # Derived elastic_info tensor consumed by the MC2 dispatch kernel;
+        # rebuilt in place on every mask change (see ``_build``).
+        self.elastic_info: torch.Tensor | None = None
         global _ACTIVE_ELASTIC_INFO_MASK
         _ACTIVE_ELASTIC_INFO_MASK = self
         self._build()
@@ -264,7 +252,13 @@ class ElasticInfoMask:
         table2 = torch.full((self.ep_size,), -1, dtype=torch.int32, device=self.device)
         table2[: len(valid)] = torch.tensor(valid, dtype=torch.int32, device=self.device)
         elastic_info = torch.cat([base_config, table1, table2], dim=0).to(torch.int32)
-        set_elastic_info(elastic_info)
+        # Keep the tensor storage stable across rebuilds so references captured
+        # by the token dispatcher (e.g. for graph capture) stay valid.
+        if self.elastic_info is None:
+            self.elastic_info = elastic_info
+        else:
+            assert self.elastic_info.shape == elastic_info.shape
+            self.elastic_info.copy_(elastic_info)
 
 
 def get_mc2_group() -> GroupCoordinator:
