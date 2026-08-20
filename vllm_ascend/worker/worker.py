@@ -383,8 +383,8 @@ class NPUWorker(WorkerBase):
 
         if self.vllm_config.parallel_config.enable_fault_tolerance:
             init_elastic_info(
-                self._ep_size_for_elatic,
-                self.num_logical_expert + self._num_redundant_experts_for_elatic)
+                self._ep_size_for_elatic, self.num_logical_expert + self._num_redundant_experts_for_elatic
+            )
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
