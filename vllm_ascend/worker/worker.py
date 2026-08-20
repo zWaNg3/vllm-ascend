@@ -1099,31 +1099,39 @@ class NPUWorker(WorkerBase):
         )
         # TODO(FT-DEBUG): remove after diagnosing DP-metadata mismatch after scale-down.
         from vllm.distributed import get_dp_group
+        from vllm.forward_context import DPMetadata
 
         dp_group = get_dp_group()
         logger.info(
-            "[FT][DEBUG] execute_dummy_batch: num_tokens=%d dp_rank=%d dp_size=%d dp_cpu_group=%s dp_device_group=%s",
+            "[FT][DEBUG] execute_dummy_batch: num_tokens=%d decode_query_len=%s dp_rank=%d dp_size=%d "
+            "dp_cpu_group=%s dp_device_group=%s",
             num_tokens,
+            getattr(self.model_runner, "decode_query_len", None),
             self.parallel_config.data_parallel_rank,
             self.parallel_config.data_parallel_size,
             getattr(dp_group, "cpu_group", None),
             getattr(dp_group, "device_group", None),
         )
+
+        _orig_make = DPMetadata.make
+
+        def _debug_make(parallel_config, n_tokens, num_tokens_across_dp_cpu):
+            try:
+                _orig_make(parallel_config, n_tokens, num_tokens_across_dp_cpu)
+            except AssertionError:
+                logger.error(
+                    "[FT][DEBUG] DPMetadata.make: dp_rank=%d batchsize(num_tokens)=%d num_tokens_across_dp_cpu=%s",
+                    parallel_config.data_parallel_rank,
+                    n_tokens,
+                    num_tokens_across_dp_cpu.tolist(),
+                )
+                raise
+
+        DPMetadata.make = staticmethod(_debug_make)
         try:
             self.model_runner._dummy_run(num_tokens, uniform_decode=True)
-        except Exception as exc:  # noqa: BLE001
-            from vllm.forward_context import get_forward_context
-
-            fc = get_forward_context()
-            dm = getattr(fc, "dp_metadata", None)
-            logger.exception("[FT][DEBUG] _dummy_run failed: %r", exc)
-            if dm is not None:
-                logger.error(
-                    "[FT][DEBUG] dp_metadata.num_tokens_across_dp_cpu=%s dp_rank=%d",
-                    dm.num_tokens_across_dp_cpu.tolist(),
-                    self.parallel_config.data_parallel_rank,
-                )
-            raise
+        finally:
+            DPMetadata.make = _orig_make
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
