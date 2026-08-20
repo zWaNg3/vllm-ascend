@@ -220,6 +220,12 @@ class WorkerSentinel(GPUWorkerSentinel):
         # ``params["dead_dp_ranks"]``), so no manual update_mask is needed here.
         self._redistribute_experts(dead_ep_ranks)
 
+        # The FT elastic_info / densified expert maps are MC2-specific, so pin
+        # the MoE communication to MC2 for every subsequent forward.
+        from vllm_ascend.ascend_forward_context import set_force_mc2
+
+        set_force_mc2(True)
+
         # Verify the reconfigured MoE can actually run.
         self.worker.execute_dummy_batch()
         torch.npu.synchronize()
