@@ -37,6 +37,15 @@ def evaluate_pause_condition() -> None:
         raise EngineLoopPausedError("Worker is paused as a fault was detected on another rank.")
 
 
+def _ep_ranks_to_dp_ranks(excluded_ep_ranks: list[int], ep2dp_map: dict[int, int], tp_size: int) -> list[int]:
+    affected_dp_ranks: list[int] = []
+    for ep_rank in excluded_ep_ranks:
+        dp_rank = ep2dp_map.get(ep_rank)
+        if dp_rank is not None and dp_rank != -1:
+            affected_dp_ranks.append(dp_rank)
+    return sorted(affected_dp_ranks)
+
+
 class NPUWorkerSentinel(BaseSentinel):
     def __init__(
         self,
@@ -165,14 +174,12 @@ class NPUWorkerSentinel(BaseSentinel):
             enable_d2d_rebalance = False
 
         scale_down_helper = ScaleDownHelper(self.worker.vllm_config, self.worker.model_runner, self.worker.quant)
-        # Currently,only TP=1 is supported.Therefore excluded_dp_ranks = excluded_ep_ranks
-        # TODO: In scenarios TP>1,the logic for converting from
-        #  excluded_ep_ranks to excluded_dp_ranks needs to be added
-        excluded_dp_ranks = excluded_ep_ranks
+        tp_size = self.worker.vllm_config.parallel_config.tensor_parallel_size
+        excluded_dp_ranks = _ep_ranks_to_dp_ranks(excluded_ep_ranks, self.worker.ep2dp_map, tp_size)
 
         # Phase 1: Expert distribution recalculation
         experts_to_load = scale_down_helper.get_expert_distribution_after_scale_down(
-            excluded_dp_ranks, enable_d2d_rebalance, new_dp_rank
+            excluded_ep_ranks, enable_d2d_rebalance, new_dp_rank
         )
         num_add_experts_per_rank = self.worker.model_runner.shared_dict["num_add_experts_per_rank"]
 

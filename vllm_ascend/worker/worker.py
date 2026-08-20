@@ -200,7 +200,8 @@ class NPUWorker(WorkerBase):
                 self.use_mask_mc2 = True
 
             self.model_loaded = False
-            init_elastic_info(ep_size, self.num_logical_expert + num_redundant_experts)
+            self._ep_size_for_elatic = ep_size
+            self._num_redundant_experts_for_elatic = num_redundant_experts
 
     def uninstall_static_kernel(self):
         import fcntl
@@ -379,6 +380,11 @@ class NPUWorker(WorkerBase):
             self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)
         else:
             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
+
+        if self.vllm_config.parallel_config.enable_fault_tolerance:
+            init_elastic_info(
+                self._ep_size_for_elatic,
+                self.num_logical_expert + self._num_redundant_experts_for_elatic)
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:

@@ -343,13 +343,13 @@ class ScaleDownHelper:
         self.model_runner = model_runner
         self.quant = quant
 
-    def get_expert_distribution_after_scale_down(self, excluded_dp_ranks, enable_d2d_rebalance, rank):
+    def get_expert_distribution_after_scale_down(self, excluded_ep_ranks, enable_d2d_rebalance, rank):
         """Wake up EPLB worker and get the new expert distribution for this rank."""
         model_runner = self.model_runner
         eplb_updator = model_runner.eplb_updator
         model_runner.shared_dict["scale_down"] = True
         model_runner.shared_dict["enable_d2d_after_failure"] = enable_d2d_rebalance
-        model_runner.shared_dict["excluded_dp_ranks"] = excluded_dp_ranks
+        model_runner.shared_dict["excluded_ep_ranks"] = excluded_ep_ranks
         expert_maps = model_runner.shared_dict["expert_maps"]
         if expert_maps is None or (expert_maps.shape == (1, 1, 1) and not expert_maps.any()):
             model_runner.shared_dict["expert_maps"] = self._get_global_expert_map()
@@ -636,46 +636,60 @@ class ScaleDownHelper:
 
 def init_dp_cpu_group_impl(vllm_config: VllmConfig, coord_store, group_type="normal") -> None:
     """Initialize DP CPU group using TCP store for port coordination."""
+    tp_rank = get_tp_group().rank
+    tp_size = get_tp_group().world_size
+    dp_rank = vllm_config.parallel_config.data_parallel_rank
+    dp_size = vllm_config.parallel_config.data_parallel_size
+
+    store_key = f"{STORE_KEY}_{group_type}_tp{tp_rank}" if tp_size > 1 else STORE_KEY
+    num_ports_per_group = 2 if get_ascend_config().eplb_config.dynamic_eplb else 1
+    fmt = f"!{num_ports_per_group}I"
     listen_sockets = []
     ports = []
-    if vllm_config.parallel_config.data_parallel_rank == 0:
-        for i in range(2):
+    if dp_rank == 0:
+        for i in range(num_ports_per_group):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.bind((vllm_config.parallel_config.data_parallel_master_ip, 0))
             sock.listen()
             listen_sockets.append(sock)
             ports.append(sock.getsockname()[1])
-        coord_store.set(STORE_KEY, struct.pack(_PORTS_FMT, *ports))
+        coord_store.set(store_key, struct.pack(fmt, *ports))
     else:
-        ports = list(struct.unpack(_PORTS_FMT, coord_store.get(STORE_KEY)))
+        raw = coord_store.get(store_key)
+        ports = list(struct.unpack(fmt, raw))
         listen_sockets = []
 
     timeout = timedelta(seconds=vllm_config.parallel_config.gloo_timeout_seconds)
 
-    eplb_port, dp_port = ports
+    port_offset = 0
     if get_ascend_config().eplb_config.dynamic_eplb:
+        eplb_port = ports[port_offset]
+
         get_dynamic_eplb_group().cpu_group = stateless_init_torch_distributed_process_group(
             vllm_config.parallel_config.data_parallel_master_ip,
             eplb_port,
-            vllm_config.parallel_config.data_parallel_rank,
-            vllm_config.parallel_config.data_parallel_size,
-            listen_socket=listen_sockets[0] if listen_sockets else None,
+            dp_rank,
+            dp_size,
+            listen_socket=listen_sockets[port_offset] if listen_sockets else None,
             backend="gloo",
-            group_name=_get_unique_name("eplb_group"),
+            group_name=_get_unique_name(f"eplb_group_tp{tp_rank}"),
         )
+        get_dynamic_eplb_group().group_type = group_type
         _set_pg_timeout(timeout=timeout, group=get_dynamic_eplb_group().cpu_group)
+        port_offset += 1
 
+    dp_port = ports[port_offset]
     get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
         vllm_config.parallel_config.data_parallel_master_ip,
         dp_port,
-        vllm_config.parallel_config.data_parallel_rank,
-        vllm_config.parallel_config.data_parallel_size,
+        dp_rank,
+        dp_size,
         backend="gloo",
-        listen_socket=listen_sockets[1] if listen_sockets else None,
-        group_name=_get_unique_name("dp_group"),
+        listen_socket=listen_sockets[port_offset] if listen_sockets else None,
+        group_name=_get_unique_name(f"dp_group_tp{tp_rank}"),
     )
     _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
-
+    get_dp_group().group_type = group_type
     for sock in listen_sockets:
         with contextlib.suppress(OSError):
             sock.close()

@@ -66,11 +66,11 @@ class EplbWorker:
         # Get the updated expert table based on the workload information
         old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)
         if self.shared_dict["scale_down"]:
-            exclude_dp_ranks = self.shared_dict["excluded_dp_ranks"]
+            exclude_ep_ranks = self.shared_dict["excluded_ep_ranks"]
             enable_d2d_after_failure = self.shared_dict["enable_d2d_after_failure"]
-            self.update_rank_id(exclude_dp_ranks)
+            self.update_rank_id(exclude_ep_ranks)
             new_placement, old_deployment, need_load_h2d, num_add_experts_per_rank = self.trigger_fault_redeployment(
-                load_info, old_placement, exclude_dp_ranks, enable_d2d_after_failure
+                load_info, old_placement, exclude_ep_ranks, enable_d2d_after_failure
             )
             if not torch.is_tensor(old_deployment):
                 old_placement = torch.tensor(old_deployment)
@@ -281,9 +281,9 @@ class EplbWorker:
 
         return list(zip(send_all, recv_all, maps, log2phy_all, layer_ids))
 
-    def trigger_fault_redeployment(self, load_info, old_placement, exclude_dp_ranks, enable_d2d_after_failure):
+    def trigger_fault_redeployment(self, load_info, old_placement, exclude_ep_ranks, enable_d2d_after_failure):
         policy = PolicyFactory.generate_policy(4, DynamicConfig())
-        policy.failed_cards = exclude_dp_ranks
+        policy.failed_cards = exclude_ep_ranks
         policy.enable_d2d_after_failure = enable_d2d_after_failure
         policy.rank_id_to_node_id = self.rank_id_to_node_id
 
@@ -293,8 +293,8 @@ class EplbWorker:
 
         return new_deployment, old_deployment, need_load_h2d, num_add_experts_per_rank
 
-    def update_rank_id(self, exclude_dp_ranks: list[int]):
-        unique_fault_ids = sorted(list(set(exclude_dp_ranks)))
+    def update_rank_id(self, exclude_ep_ranks: list[int]):
+        unique_fault_ids = sorted(list(set(exclude_ep_ranks)))
         fault_count = 0
         for fault_id in unique_fault_ids:
             if fault_id <= self.rank_id:
