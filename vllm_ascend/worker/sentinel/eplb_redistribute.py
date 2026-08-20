@@ -95,8 +95,12 @@ def reload_experts_from_disk(
     for layer_idx, logical in reload_set:
         layer = moe_layers[layer_idx]
         routed = layer.routed_experts
-        base = f"{layer.layer_name}.{logical}."
         slot = int(routed._expert_map[logical].item())
+        if slot < 0:
+            # This rank does not host the re-hosted expert (its ``_expert_map``
+            # entry stayed -1); only the hosting rank must reload the weights.
+            continue
+        base = f"{layer.layer_name}.{logical}."
 
         w1 = saved_weights[f"{base}gate_proj.weight"]
         w3 = saved_weights[f"{base}up_proj.weight"]
