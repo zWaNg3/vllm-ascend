@@ -84,7 +84,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         (``AscendEplbState``). Redistribution masks the dead EP ranks'
         physical slots, re-hosts the orphaned logical experts into spare
         (redundant) slots, rebuilds the logical maps in place and reloads the
-        affected weights through the standard loader.
+        affected weights into the Ascend runtime layout (unquantized or W8A8).
         """
         from vllm.distributed import get_ep_group
         from vllm.v1.worker.sentinel.eplb_redistribute import (
@@ -93,8 +93,9 @@ class WorkerSentinel(GPUWorkerSentinel):
             rebuild_logical_expert_maps,
             rebuild_model_expert_maps,
             redistribute_expert_placement,
-            reload_experts_from_disk,
         )
+
+        from vllm_ascend.worker.sentinel.eplb_redistribute import reload_experts_from_disk
 
         model_runner = self.worker.model_runner
         eplb_state = getattr(model_runner, "eplb_state", None)
