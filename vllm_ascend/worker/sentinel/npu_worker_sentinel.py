@@ -197,14 +197,19 @@ class WorkerSentinel(GPUWorkerSentinel):
         # (the upstream retry reads dp_group_rank/dp_group_size from params).
         self.retry(ft_request)
 
-        # Refresh the reduced DP membership on the parallel config (the v2
-        # runner reads it directly and keeps no runner-local copy).
+        # Refresh the reduced DP membership on the parallel config AND the v2
+        # model runner (the runner caches dp_size/dp_rank and uses them for the
+        # per-step DP metadata sync; leaving them stale makes
+        # dispatch_cg_and_sync_dp build a wrong-width num_tokens_across_dp).
         dp_group_rank = int(params.get("dp_group_rank", params.get("new_dp_rank")))
         dp_group_size = int(params.get("dp_group_size", params.get("new_dp_size")))
         self.dp_rank = dp_group_rank
         self.dp_size = dp_group_size
         parallel_config.data_parallel_rank = dp_group_rank
         parallel_config.data_parallel_size = dp_group_size
+        model_runner = self.worker.model_runner
+        model_runner.dp_rank = dp_group_rank
+        model_runner.dp_size = dp_group_size
 
         from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 
