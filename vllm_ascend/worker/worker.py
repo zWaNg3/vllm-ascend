@@ -1098,20 +1098,7 @@ class NPUWorker(WorkerBase):
             getattr(self.model_runner, "uniform_decode_query_len", 1),
         )
         # TODO(FT-DEBUG): remove after diagnosing DP-metadata mismatch after scale-down.
-        from vllm.distributed import get_dp_group
         from vllm.forward_context import DPMetadata
-
-        dp_group = get_dp_group()
-        logger.info(
-            "[FT][DEBUG] execute_dummy_batch: num_tokens=%d decode_query_len=%s dp_rank=%d dp_size=%d "
-            "dp_cpu_group=%s dp_device_group=%s",
-            num_tokens,
-            getattr(self.model_runner, "decode_query_len", None),
-            self.parallel_config.data_parallel_rank,
-            self.parallel_config.data_parallel_size,
-            getattr(dp_group, "cpu_group", None),
-            getattr(dp_group, "device_group", None),
-        )
 
         _orig_make = DPMetadata.make
 
