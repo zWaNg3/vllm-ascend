@@ -34,21 +34,21 @@ FAULT_DETECTION_DEADLINE_S = 45
 # ---------------------------------------------------------------------------
 # Fault-injection via sitecustomize.py
 # ---------------------------------------------------------------------------
-# Patches ``NPUModelRunner._sync_metadata_across_dp`` to raise on ``rank`` at
-# a chosen step. Gated on VLLM_FT_TEST_INJECT_FAULT.
+# Patches ``NPUModelRunner.execute_model`` (model runner V2) to raise on
+# ``rank`` at a chosen step. Gated on VLLM_FT_TEST_INJECT_FAULT.
 #
-# The import hook waits for ``vllm_ascend.worker.model_runner_v1`` to land
-# in sys.modules and for ``NPUModelRunner._sync_metadata_across_dp`` to be
-# defined, then wraps the method with a step-counting wrapper.
+# The import hook waits for ``vllm_ascend.worker.v2.model_runner`` to land
+# in sys.modules and for ``NPUModelRunner.execute_model`` to be defined, then
+# wraps the method with a step-counting wrapper.
 _FAULT_INJECT_SITECUSTOMIZE = """\
 import builtins
 import os
 import sys
 
 _SPEC = os.environ.get("VLLM_FT_TEST_INJECT_FAULT")
-_MODULE = "vllm_ascend.worker.model_runner_v1"
+_MODULE = "vllm_ascend.worker.v2.model_runner"
 _CLASS = "NPUModelRunner"
-_METHOD = "_sync_metadata_across_dp"
+_METHOD = "execute_model"
 
 if _SPEC:
     _f = dict(kv.split("=", 1) for kv in _SPEC.split(","))
@@ -61,7 +61,7 @@ if _SPEC:
 
         def _wrapped(self, *args, **kwargs):
             result = _orig(self, *args, **kwargs)
-            if self.dp_rank == _RANK:
+            if self.vllm_config.parallel_config.data_parallel_rank == _RANK:
                 _steps[0] += 1
                 if _steps[0] == _STEP:
                     raise RuntimeError(
@@ -372,7 +372,7 @@ def has_npu_ft_capability() -> bool:
     reason="Requires at least 4 NPUs for DP=4 fault-tolerance testing",
 )
 def test_injected_fault_retry_recovers_all_ranks(monkeypatch, tmp_path):
-    """An exception injected into _sync_metadata_across_dp drives full
+    """An exception injected into the v2 runner's execute_model drives full
     retry recovery on all 4 DP ranks.
 
     Inject a fault at a chosen step on rank 3:
