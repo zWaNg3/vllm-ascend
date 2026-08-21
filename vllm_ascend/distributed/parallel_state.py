@@ -184,18 +184,17 @@ class ElasticInfoMask:
 
     - ``table1[ep_rank]``: local (densified) EP rank after scale-down, ``-1``
       for dead ranks
-    - ``table2[local_ep_rank]``: original EP rank of that local slot, ``-1``
-      for invalid slots
+    - ``table2[local_ep_rank]``: local (densified) EP rank for valid slots,
+      ``-1`` for invalid slots
 
-    Slots model (see vllm-project/vllm#46370): rank coordinates are kept
-    ORIGINAL everywhere outside the kernel — physical expert ids stay in
-    ``[0, ep_world_size*num_local)`` and ``parallel_config``/``dp_rank``/
-    ``dp_size`` stay frozen. Only the kernel-facing ``elastic_info`` is
-    DENSIFIED: ``_build`` is a construction-time conversion that renumbers the
-    surviving EP ranks ``0..k-1`` (no holes) so the MC2 kernel's scaled-down
-    routing space matches ``scaled_down_ep_size``. ``num_physical_experts``
-    keeps the original expert width because the ``expert_ids`` handed to the
-    kernel stay in the original physical id space.
+    The kernel-facing ``elastic_info`` is DENSIFIED at construction time: the
+    surviving EP ranks are renumbered ``0..k-1`` (no holes) into
+    ``scaled_down_ep_size`` so the MC2 kernel's scaled-down routing space is
+    compact. All state OUTSIDE elastic_info keeps the ORIGINAL (non-densified)
+    coordinates — physical expert ids stay in ``[0, ep_size*num_local)`` and
+    ``num_physical_experts`` keeps the original expert width, so the kernel
+    derives ``num_local = num_physical_experts // ep_size`` from the original
+    EP world and only the rank routing is compacted via ``table1``.
     """
 
     def __init__(
@@ -238,17 +237,19 @@ class ElasticInfoMask:
             dtype=torch.int32,
             device=self.device,
         )
-        # Construction-time conversion to the DENSIFIED id space expected by
-        # the MC2 kernel: the surviving EP ranks are renumbered 0..k-1 (no
-        # holes) and dead ranks are -1. All state OUTSIDE elastic_info keeps
-        # the original (non-densified) coordinates, so this is purely an
-        # encoding of the mask.
+        # Construction-time densification of the mask: the surviving EP ranks
+        # are renumbered 0..k-1 (no holes) so the kernel's scaled-down routing
+        # space is compact. Everything outside elastic_info keeps the original
+        # (non-densified) coordinates, so this is purely an encoding of the
+        # mask. num_physical_experts stays the original expert width because
+        # the expert_ids fed to the kernel keep the original physical ids.
         # table1[ep_rank] = local (densified) EP rank, -1 for dead ranks.
         table1 = torch.full((self.ep_size,), -1, dtype=torch.int32, device=self.device)
         table1[valid] = torch.arange(len(valid), dtype=torch.int32, device=self.device)
-        # table2[local_ep_rank] = original EP rank, -1 for invalid slots.
+        # table2[local_ep_rank] = local (densified) EP rank for valid slots,
+        # -1 for invalid slots.
         table2 = torch.full((self.ep_size,), -1, dtype=torch.int32, device=self.device)
-        table2[: len(valid)] = torch.tensor(valid, dtype=torch.int32, device=self.device)
+        table2[: len(valid)] = torch.arange(len(valid), dtype=torch.int32, device=self.device)
         elastic_info = torch.cat([base_config, table1, table2], dim=0).to(torch.int32)
         # Keep the tensor storage stable across rebuilds so references captured
         # by the token dispatcher (e.g. for graph capture) stay valid.
