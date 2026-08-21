@@ -118,17 +118,44 @@ class WorkerSentinel(GPUWorkerSentinel):
         mark_dead_expert_slots_inplace(p2l, dead_ep_ranks, num_local_experts)
         reassignments = redistribute_expert_placement(p2l, num_logical, num_local_experts)
         rebuild_logical_expert_maps(p2l, l2p, lrc)
-        # Slots model (see vllm-project/vllm#46370): the EP topology keeps its
-        # ORIGINAL rank coordinates after scale-down. Physical expert ids stay
-        # in [0, ep_world_size*num_local) and dead EP ranks are excluded purely
-        # via the elastic_info mask (-1 in the rank tables), so neither the
-        # expert ids nor num_physical_experts are renumbered/shrunk here.
+        # The MC2 dispatch/combine kernels expect expert_ids in the DENSIFIED
+        # space [0, alive_ep*num_local) after scale-down. The persistent EPLB
+        # maps (l2p/lrc) keep the ORIGINAL coordinates (slots model, see
+        # vllm-project/vllm#46370); the densification is applied as a
+        # construction-time conversion on the kernel-facing routing table, so
+        # map_to_physical emits densified physical ids for both dispatch and
+        # combine. Dead EP ranks are excluded via the elastic_info mask (-1).
         # The Ascend MC2 dispatch reads each layer's derived
         # ``expert_replica_routing_table`` (built from l2p/lrc + ep_rank), so
         # refresh it after the logical maps change.
         from vllm_ascend.distributed.eplb_state import refresh_model_routing_tables
 
         refresh_model_routing_tables(ms)
+        surviving = sorted(set(range(ep_world_size)) - dead_ep_ranks)
+        rank_to_local = {orig: i for i, orig in enumerate(surviving)}
+        if len(rank_to_local) < ep_world_size:
+            from vllm_ascend.distributed.eplb_state import AscendEplbLayerState
+            from vllm_ascend.ops.fused_moe.eplb import densify_expert_replica_routing_table
+
+            for layer in ms.model.moe_layers:
+                layer_state = layer.eplb_state
+                if not isinstance(layer_state, AscendEplbLayerState):
+                    continue
+                table = layer_state.expert_replica_routing_table
+                if table is None:
+                    continue
+                densified = densify_expert_replica_routing_table(
+                    table,
+                    rank_to_local,
+                    num_local_experts,
+                    ep_world_size,
+                )
+                table.copy_(densified)
+            # Keep elastic_info's physical expert width consistent with the
+            # densified expert id space (alive_ep * num_local).
+            mask = getattr(self.worker, "elastic_info_mask", None)
+            if mask is not None:
+                mask.set_num_physical_experts(len(surviving) * num_local_experts)
         rebuild_model_expert_maps(model_runner.model, p2l)
         if reassignments:
             reload_experts_from_disk(model_runner.model, self.worker.vllm_config, reassignments)

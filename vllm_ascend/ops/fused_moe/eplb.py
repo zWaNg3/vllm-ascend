@@ -34,6 +34,40 @@ def build_expert_replica_routing_table(
     return routing_table.to(torch.int32).contiguous()
 
 
+def densify_expert_replica_routing_table(
+    routing_table: torch.Tensor,
+    rank_to_local: dict[int, int],
+    num_local: int,
+    ep_world_size: int,
+) -> torch.Tensor:
+    """Remap routing-table physical ids into the densified post-scale-down space.
+
+    The MC2 dispatch/combine kernels expect ``expert_ids`` in
+    ``[0, alive_ep*num_local)`` after scale-down. The routing table is built
+    from the (non-densified) ``logical_to_physical_map``, so each physical id
+    ``orig_rank*num_local + slot`` is converted to
+    ``rank_to_local[orig_rank]*num_local + slot``; slots owned by dead ranks
+    become ``-1``. This keeps the persistent EPLB maps in the original
+    coordinates (slots model) while densifying only the kernel-facing ids.
+    """
+    rank_map = torch.full(
+        (ep_world_size,),
+        -1,
+        dtype=torch.int64,
+        device=routing_table.device,
+    )
+    for orig_rank, new_rank in rank_to_local.items():
+        rank_map[orig_rank] = new_rank
+
+    orig = routing_table.to(torch.int64)
+    mask = orig >= 0
+    orig_rank = torch.where(mask, orig // num_local, 0)
+    slot = torch.where(mask, orig % num_local, 0)
+    new_rank = rank_map[orig_rank]
+    pid = torch.where(mask, new_rank * num_local + slot, -1)
+    return torch.where(pid < 0, -1, pid).to(routing_table.dtype)
+
+
 def map_to_physical(
     topk_ids: torch.Tensor,
     expert_replica_routing_table: torch.Tensor,

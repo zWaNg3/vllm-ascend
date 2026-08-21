@@ -189,12 +189,12 @@ class ElasticInfoMask:
 
     The kernel-facing ``elastic_info`` is DENSIFIED at construction time: the
     surviving EP ranks are renumbered ``0..k-1`` (no holes) into
-    ``scaled_down_ep_size`` so the MC2 kernel's scaled-down routing space is
-    compact. All state OUTSIDE elastic_info keeps the ORIGINAL (non-densified)
-    coordinates — physical expert ids stay in ``[0, ep_size*num_local)`` and
-    ``num_physical_experts`` keeps the original expert width, so the kernel
-    derives ``num_local = num_physical_experts // ep_size`` from the original
-    EP world and only the rank routing is compacted via ``table1``.
+    ``scaled_down_ep_size`` and ``num_physical_experts`` is shrunk to
+    ``alive_ep * num_local``, matching the densified ``expert_ids`` fed to the
+    MC2 kernels. All state OUTSIDE elastic_info keeps the ORIGINAL
+    (non-densified) coordinates — the EPLB maps, the DP config and the expert
+    weights keep the original ids; only the kernel-facing expert space
+    (routing table + elastic_info) is compacted.
     """
 
     def __init__(
@@ -224,6 +224,16 @@ class ElasticInfoMask:
             self._masked.discard(ep_rank)
         self._build()
 
+    def set_num_physical_experts(self, num_physical_experts: int) -> None:
+        """Update the physical-expert count seen by the MC2 kernel.
+
+        After scale-down the kernel-facing expert space is densified to
+        ``alive_ep * num_local`` (matching the densified ``expert_ids``), so
+        the elastic_info expert width is shrunk accordingly.
+        """
+        self.num_physical_experts = num_physical_experts
+        self._build()
+
     def query_active_mask(self) -> list[int]:
         """Return a per-EP-rank mask (1 = alive, 0 = dead)."""
         return [0 if rank in self._masked else 1 for rank in range(self.ep_size)]
@@ -239,10 +249,10 @@ class ElasticInfoMask:
         )
         # Construction-time densification of the mask: the surviving EP ranks
         # are renumbered 0..k-1 (no holes) so the kernel's scaled-down routing
-        # space is compact. Everything outside elastic_info keeps the original
-        # (non-densified) coordinates, so this is purely an encoding of the
-        # mask. num_physical_experts stays the original expert width because
-        # the expert_ids fed to the kernel keep the original physical ids.
+        # space is compact. num_physical_experts is set to alive_ep*num_local
+        # (see set_num_physical_experts) to match the densified expert_ids.
+        # Everything outside elastic_info keeps the original (non-densified)
+        # coordinates, so this is purely an encoding of the mask.
         # table1[ep_rank] = local (densified) EP rank, -1 for dead ranks.
         table1 = torch.full((self.ep_size,), -1, dtype=torch.int32, device=self.device)
         table1[valid] = torch.arange(len(valid), dtype=torch.int32, device=self.device)
