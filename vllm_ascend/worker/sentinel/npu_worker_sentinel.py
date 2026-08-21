@@ -118,30 +118,11 @@ class WorkerSentinel(GPUWorkerSentinel):
         mark_dead_expert_slots_inplace(p2l, dead_ep_ranks, num_local_experts)
         reassignments = redistribute_expert_placement(p2l, num_logical, num_local_experts)
         rebuild_logical_expert_maps(p2l, l2p, lrc)
-        # The Ascend MC2 kernel's elastic_info expects the DENSIFIED id space
-        # after scale-down: the surviving EP ranks are renumbered 0..k-1 and
-        # physical ids become local_rank*num_local+slot in
-        # [0, alive_ep*num_local). The upstream rebuild keeps the ORIGINAL
-        # physical ids, which overflow the kernel's scaled-down expert space.
-        surviving = sorted(set(range(ep_world_size)) - dead_ep_ranks)
-        rank_to_local = {orig: i for i, orig in enumerate(surviving)}
-        if rank_to_local and len(rank_to_local) < ep_world_size:
-            l2p_cpu = l2p.cpu()
-            lrc_cpu = lrc.cpu()
-            for layer_idx in range(l2p_cpu.shape[0]):
-                for logical in range(l2p_cpu.shape[1]):
-                    for rep in range(int(lrc_cpu[layer_idx, logical])):
-                        pid = int(l2p_cpu[layer_idx, logical, rep])
-                        if pid < 0:
-                            continue
-                        orig_rank, slot = divmod(pid, num_local_experts)
-                        l2p_cpu[layer_idx, logical, rep] = rank_to_local[orig_rank] * num_local_experts + slot
-            l2p.copy_(l2p_cpu)
-            # Keep elastic_info's expert width consistent with the densified
-            # ids (alive_ep * num_local).
-            mask = getattr(self.worker, "elastic_info_mask", None)
-            if mask is not None:
-                mask.set_num_physical_experts(len(surviving) * num_local_experts)
+        # Slots model (see vllm-project/vllm#46370): the EP topology keeps its
+        # ORIGINAL rank coordinates after scale-down. Physical expert ids stay
+        # in [0, ep_world_size*num_local) and dead EP ranks are excluded purely
+        # via the elastic_info mask (-1 in the rank tables), so neither the
+        # expert ids nor num_physical_experts are renumbered/shrunk here.
         # The Ascend MC2 dispatch reads each layer's derived
         # ``expert_replica_routing_table`` (built from l2p/lrc + ep_rank), so
         # refresh it after the logical maps change.
@@ -172,6 +153,13 @@ class WorkerSentinel(GPUWorkerSentinel):
         the orphaned experts are deterministically re-hosted on surviving
         ranks' redundant slots, with weights reloaded from disk.
 
+        Slots model (see vllm-project/vllm#46370): rank coordinates never
+        change. ``parallel_config.data_parallel_rank/size`` and the model
+        runner's cached ``dp_rank``/``dp_size`` stay frozen at their initial
+        values; only the DP Gloo ``cpu_group`` is rebuilt dense over the
+        surviving slots. Dead EP ranks are excluded at the MC2 kernel via the
+        elastic_info mask, so no graph recompile or re-capture is needed.
+
         Only the model runner V2 is supported: the EPLB maps live in
         ``model_runner.eplb_state`` (``AscendEplbState``).
         """
@@ -193,23 +181,15 @@ class WorkerSentinel(GPUWorkerSentinel):
         self.worker.model_runner.eep_eplb_suppressed = True
 
         # Reuse the upstream retry flow: reset device, clean worker state and
-        # re-create the DP Gloo group with the reduced (densified) membership
-        # (the upstream retry reads dp_group_rank/dp_group_size from params).
+        # re-create the DP Gloo group over the surviving slots (dense internal
+        # ranks, read from dp_group_rank/dp_group_size in params). Under the
+        # slots model the ORIGINAL rank coordinates are kept everywhere else:
+        # parallel_config.data_parallel_rank/size and the v2 model runner's
+        # cached dp_rank/dp_size stay frozen at their initial values, so the
+        # per-step DP metadata sync keeps the original tensor width and indexes
+        # each rank by its original DP rank (dead columns are neutralized via
+        # get_dp_group().dead_dp_ranks, see vllm/v1/worker/gpu/dp_utils.py).
         self.retry(ft_request)
-
-        # Refresh the reduced DP membership on the parallel config AND the v2
-        # model runner (the runner caches dp_size/dp_rank and uses them for the
-        # per-step DP metadata sync; leaving them stale makes
-        # dispatch_cg_and_sync_dp build a wrong-width num_tokens_across_dp).
-        dp_group_rank = int(params.get("dp_group_rank", params.get("new_dp_rank")))
-        dp_group_size = int(params.get("dp_group_size", params.get("new_dp_size")))
-        self.dp_rank = dp_group_rank
-        self.dp_size = dp_group_size
-        parallel_config.data_parallel_rank = dp_group_rank
-        parallel_config.data_parallel_size = dp_group_size
-        model_runner = self.worker.model_runner
-        model_runner.dp_rank = dp_group_rank
-        model_runner.dp_size = dp_group_size
 
         from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 
@@ -226,7 +206,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         # ``params["dead_dp_ranks"]``), so no manual update_mask is needed here.
         self._redistribute_experts(dead_ep_ranks)
 
-        # The FT elastic_info / densified expert maps are MC2-specific, so pin
+        # The FT elastic_info / masked expert maps are MC2-specific, so pin
         # the MoE communication to MC2 for every subsequent forward.
         from vllm_ascend.ascend_forward_context import set_force_mc2
 
@@ -237,7 +217,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         torch.npu.synchronize()
 
         logger.info(
-            "[FT] Worker scale_down complete: dp_size=%d, dp_rank=%d, dead_ep_ranks=%s",
+            "[FT] Worker scale_down complete: original dp_size=%d, original dp_rank=%d, dead_ep_ranks=%s",
             self.dp_size,
             self.dp_rank,
             sorted(dead_ep_ranks),

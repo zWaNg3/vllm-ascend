@@ -32,7 +32,7 @@ class MoECommType(Enum):
 _MRV2_IN_PROFILE_RUN: ContextVar[bool] = ContextVar("_MRV2_IN_PROFILE_RUN", default=False)
 
 # When True, the MoE communication method is pinned to MC2. Set after a
-# fault-tolerance scale-down: the elastic_info / densified expert maps are
+# fault-tolerance scale-down: the elastic_info / masked expert maps are
 # MC2-specific, so the surviving ranks must not fall back to FUSED_MC2 or
 # ALLTOALL based on the token-count selection.
 _FORCE_MC2 = False
@@ -44,7 +44,7 @@ def set_force_mc2(enabled: bool) -> None:
     After a scale-down every surviving worker sets this so that all
     subsequent forwards (including the post-recovery dummy run) use the MC2
     path, which is the only one that consumes the FT ``elastic_info`` and the
-    densified expert maps.
+    masked expert maps.
     """
     global _FORCE_MC2
     _FORCE_MC2 = enabled
@@ -364,7 +364,7 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig) -> MoECommT
         # forward and _dummy_run during profile_run.
         moe_comm_type = MoECommType.ALLTOALL
     elif _FORCE_MC2:
-        # Post-scale-down: the FT elastic_info / densified expert maps are
+        # Post-scale-down: the FT elastic_info / masked expert maps are
         # only handled by the MC2 path, so override the token-count based
         # selection (which may otherwise pick FUSED_MC2 or ALLTOALL).
         moe_comm_type = MoECommType.MC2
