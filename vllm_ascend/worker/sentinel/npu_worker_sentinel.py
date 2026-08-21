@@ -197,15 +197,6 @@ class WorkerSentinel(GPUWorkerSentinel):
         # (the upstream retry reads dp_group_rank/dp_group_size from params).
         self.retry(ft_request)
 
-        # Refresh the reduced DP membership on the parallel config (the v2
-        # runner reads it directly and keeps no runner-local copy).
-        dp_group_rank = int(params.get("dp_group_rank", params.get("new_dp_rank")))
-        dp_group_size = int(params.get("dp_group_size", params.get("new_dp_size")))
-        self.dp_rank = dp_group_rank
-        self.dp_size = dp_group_size
-        parallel_config.data_parallel_rank = dp_group_rank
-        parallel_config.data_parallel_size = dp_group_size
-
         from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 
         mgr = get_ep_all2all_manager()
