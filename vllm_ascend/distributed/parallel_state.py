@@ -182,18 +182,20 @@ class ElasticInfoMask:
         ``[is_scaled_down, scaled_down_ep_size, share_expert_rank_num,
         num_physical_experts] + table1(ep_size) + table2(ep_size)``
 
-    - ``table1[ep_rank]``: EP rank used by the kernel for that original rank,
-      ``-1`` for dead ranks
+    - ``table1[ep_rank]``: local (densified) EP rank after scale-down, ``-1``
+      for dead ranks
     - ``table2[local_ep_rank]``: original EP rank of that local slot, ``-1``
       for invalid slots
 
-    Slots model (see vllm-project/vllm#46370): the EP topology keeps its
-    ORIGINAL rank coordinates after scale-down. A removed rank remains an
-    empty slot and ranks are NOT renumbered, so ``table1``/``table2`` are
-    identity mappings over the original EP world size and ``scaled_down_ep_size``
-    keeps the original value; dead ranks are only marked ``-1``. The EP device
-    group, the expert width (``num_physical_experts``) and the DP config all
-    stay at their original values, so no graph recompile is needed.
+    Slots model (see vllm-project/vllm#46370): rank coordinates are kept
+    ORIGINAL everywhere outside the kernel — physical expert ids stay in
+    ``[0, ep_world_size*num_local)`` and ``parallel_config``/``dp_rank``/
+    ``dp_size`` stay frozen. Only the kernel-facing ``elastic_info`` is
+    DENSIFIED: ``_build`` is a construction-time conversion that renumbers the
+    surviving EP ranks ``0..k-1`` (no holes) so the MC2 kernel's scaled-down
+    routing space matches ``scaled_down_ep_size``. ``num_physical_experts``
+    keeps the original expert width because the ``expert_ids`` handed to the
+    kernel stay in the original physical id space.
     """
 
     def __init__(
@@ -229,19 +231,24 @@ class ElasticInfoMask:
 
     def _build(self) -> None:
         is_scaled_down = 1 if self._masked else 0
+        valid = [rank for rank in range(self.ep_size) if rank not in self._masked]
+        scaled_down_ep_size = len(valid)
         base_config = torch.tensor(
-            [is_scaled_down, self.ep_size, self.share_expert_rank_num, self.num_physical_experts],
+            [is_scaled_down, scaled_down_ep_size, self.share_expert_rank_num, self.num_physical_experts],
             dtype=torch.int32,
             device=self.device,
         )
-        # Slots model: the surviving EP ranks keep their ORIGINAL ids (no
-        # renumbering), so table1/table2 are identity mappings over the full EP
-        # world size and dead ranks are marked -1. The kernel routes around the
-        # dead slots while keeping the original coordinates.
-        table1 = torch.arange(self.ep_size, dtype=torch.int32, device=self.device)
-        for rank in sorted(self._masked):
-            table1[rank] = -1
-        table2 = torch.arange(self.ep_size, dtype=torch.int32, device=self.device)
+        # Construction-time conversion to the DENSIFIED id space expected by
+        # the MC2 kernel: the surviving EP ranks are renumbered 0..k-1 (no
+        # holes) and dead ranks are -1. All state OUTSIDE elastic_info keeps
+        # the original (non-densified) coordinates, so this is purely an
+        # encoding of the mask.
+        # table1[ep_rank] = local (densified) EP rank, -1 for dead ranks.
+        table1 = torch.full((self.ep_size,), -1, dtype=torch.int32, device=self.device)
+        table1[valid] = torch.arange(len(valid), dtype=torch.int32, device=self.device)
+        # table2[local_ep_rank] = original EP rank, -1 for invalid slots.
+        table2 = torch.full((self.ep_size,), -1, dtype=torch.int32, device=self.device)
+        table2[: len(valid)] = torch.tensor(valid, dtype=torch.int32, device=self.device)
         elastic_info = torch.cat([base_config, table1, table2], dim=0).to(torch.int32)
         # Keep the tensor storage stable across rebuilds so references captured
         # by the token dispatcher (e.g. for graph capture) stay valid.
