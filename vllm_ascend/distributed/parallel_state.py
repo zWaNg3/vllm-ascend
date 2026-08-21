@@ -184,14 +184,13 @@ class ElasticInfoMask:
 
     - ``table1[ep_rank]``: local (densified) EP rank after scale-down, ``-1``
       for dead ranks
-    - ``table2[local_ep_rank]``: local (densified) EP rank for valid slots,
-      ``-1`` for invalid slots
+    - ``table2[local_ep_rank]``: original EP rank of that local slot, ``-1``
+      for invalid slots
 
     The surviving EP ranks are DENSIFIED (renumbered 0..k-1 with no holes),
     matching the MC2 kernel's expected elastic_info semantics. The EP device
     group itself keeps its original world size; only the kernel's rank
-    mapping is compacted. ``table2`` is the identity validity table over the
-    densified slots (``[0..k-1, -1, ...]``), as required by the MC2 kernel.
+    mapping is compacted.
     """
 
     def __init__(
@@ -249,11 +248,9 @@ class ElasticInfoMask:
         # table1[ep_rank] = local (densified) EP rank, -1 for dead ranks.
         table1 = torch.full((self.ep_size,), -1, dtype=torch.int32, device=self.device)
         table1[valid] = torch.arange(len(valid), dtype=torch.int32, device=self.device)
-        # table2[local_ep_rank] = local (densified) EP rank for valid slots,
-        # -1 for invalid slots (identity validity table over the densified
-        # slots; the MC2 kernel requires this exact form).
+        # table2[local_ep_rank] = original EP rank, -1 for invalid slots.
         table2 = torch.full((self.ep_size,), -1, dtype=torch.int32, device=self.device)
-        table2[: len(valid)] = torch.arange(len(valid), dtype=torch.int32, device=self.device)
+        table2[: len(valid)] = torch.tensor(valid, dtype=torch.int32, device=self.device)
         elastic_info = torch.cat([base_config, table1, table2], dim=0).to(torch.int32)
         # Keep the tensor storage stable across rebuilds so references captured
         # by the token dispatcher (e.g. for graph capture) stay valid.
