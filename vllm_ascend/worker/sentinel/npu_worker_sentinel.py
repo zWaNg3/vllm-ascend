@@ -85,6 +85,12 @@ class WorkerSentinel(GPUWorkerSentinel):
         physical slots, re-hosts the orphaned logical experts into spare
         (redundant) slots, rebuilds the logical maps in place and reloads the
         affected weights into the Ascend runtime layout (unquantized or W8A8).
+
+        The persistent ``logical_to_physical_map`` is DENSIFIED in place
+        (surviving EP ranks renumbered 0..k-1) so the kernel-facing
+        ``expert_ids`` stay inside ``[0, alive_ep*num_local)``; the DP rank
+        coordinates are left unchanged (slots model, handled by the upstream
+        engine/sentinel).
         """
         from vllm.distributed import get_ep_group
         from vllm.v1.worker.sentinel.eplb_redistribute import (
@@ -119,43 +125,38 @@ class WorkerSentinel(GPUWorkerSentinel):
         reassignments = redistribute_expert_placement(p2l, num_logical, num_local_experts)
         rebuild_logical_expert_maps(p2l, l2p, lrc)
         # The MC2 dispatch/combine kernels expect expert_ids in the DENSIFIED
-        # space [0, alive_ep*num_local) after scale-down. The persistent EPLB
-        # maps (l2p/lrc) keep the ORIGINAL coordinates (slots model, see
-        # vllm-project/vllm#46370); the densification is applied as a
-        # construction-time conversion on the kernel-facing routing table, so
-        # map_to_physical emits densified physical ids for both dispatch and
-        # combine. Dead EP ranks are excluded via the elastic_info mask (-1).
-        # The Ascend MC2 dispatch reads each layer's derived
-        # ``expert_replica_routing_table`` (built from l2p/lrc + ep_rank), so
-        # refresh it after the logical maps change.
-        from vllm_ascend.distributed.eplb_state import refresh_model_routing_tables
-
-        refresh_model_routing_tables(ms)
+        # space [0, alive_ep*num_local) after scale-down, so densify the
+        # persistent logical_to_physical_map in place: the surviving EP ranks
+        # are renumbered 0..k-1 and physical ids become
+        # local_rank*num_local+slot. The upstream rebuild keeps the ORIGINAL
+        # physical ids, which overflow the kernel's scaled-down expert space
+        # and fault with a CCU instruction address check on the dummy batch.
         surviving = sorted(set(range(ep_world_size)) - dead_ep_ranks)
         rank_to_local = {orig: i for i, orig in enumerate(surviving)}
-        if len(rank_to_local) < ep_world_size:
-            from vllm_ascend.distributed.eplb_state import AscendEplbLayerState
-            from vllm_ascend.ops.fused_moe.eplb import densify_expert_replica_routing_table
-
-            for layer in ms.model.moe_layers:
-                layer_state = layer.eplb_state
-                if not isinstance(layer_state, AscendEplbLayerState):
-                    continue
-                table = layer_state.expert_replica_routing_table
-                if table is None:
-                    continue
-                densified = densify_expert_replica_routing_table(
-                    table,
-                    rank_to_local,
-                    num_local_experts,
-                    ep_world_size,
-                )
-                table.copy_(densified)
+        if rank_to_local and len(rank_to_local) < ep_world_size:
+            l2p_cpu = l2p.cpu()
+            lrc_cpu = lrc.cpu()
+            for layer_idx in range(l2p_cpu.shape[0]):
+                for logical in range(l2p_cpu.shape[1]):
+                    for rep in range(int(lrc_cpu[layer_idx, logical])):
+                        pid = int(l2p_cpu[layer_idx, logical, rep])
+                        if pid < 0:
+                            continue
+                        orig_rank, slot = divmod(pid, num_local_experts)
+                        l2p_cpu[layer_idx, logical, rep] = rank_to_local[orig_rank] * num_local_experts + slot
+            l2p.copy_(l2p_cpu)
             # Keep elastic_info's physical expert width consistent with the
             # densified expert id space (alive_ep * num_local).
             mask = getattr(self.worker, "elastic_info_mask", None)
             if mask is not None:
                 mask.set_num_physical_experts(len(surviving) * num_local_experts)
+        # The Ascend MC2 dispatch reads each layer's derived
+        # ``expert_replica_routing_table`` (built from l2p/lrc + ep_rank), so
+        # refresh it after the logical maps change (now built from the
+        # densified l2p).
+        from vllm_ascend.distributed.eplb_state import refresh_model_routing_tables
+
+        refresh_model_routing_tables(ms)
         rebuild_model_expert_maps(model_runner.model, p2l)
         if reassignments:
             reload_experts_from_disk(model_runner.model, self.worker.vllm_config, reassignments)
@@ -185,7 +186,10 @@ class WorkerSentinel(GPUWorkerSentinel):
         runner's cached ``dp_rank``/``dp_size`` stay frozen at their initial
         values; only the DP Gloo ``cpu_group`` is rebuilt dense over the
         surviving slots. Dead EP ranks are excluded at the MC2 kernel via the
-        elastic_info mask, so no graph recompile or re-capture is needed.
+        elastic_info mask. The EXPERT id space, however, is densified
+        (surviving EP ranks renumbered 0..k-1 in the persistent
+        ``logical_to_physical_map``) because the MC2 kernels require
+        ``expert_ids`` in ``[0, alive_ep*num_local)`` after scale-down.
 
         Only the model runner V2 is supported: the EPLB maps live in
         ``model_runner.eplb_state`` (``AscendEplbState``).

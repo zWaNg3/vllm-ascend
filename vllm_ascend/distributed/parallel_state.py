@@ -257,7 +257,8 @@ class ElasticInfoMask:
         table1 = torch.full((self.ep_size,), -1, dtype=torch.int32, device=self.device)
         table1[valid] = torch.arange(len(valid), dtype=torch.int32, device=self.device)
         # table2[local_ep_rank] = local (densified) EP rank for valid slots,
-        # -1 for invalid slots.
+        # -1 for invalid slots (identity over the densified slots; the kernel
+        # requires this exact form, see feature/ft-framework_0819).
         table2 = torch.full((self.ep_size,), -1, dtype=torch.int32, device=self.device)
         table2[: len(valid)] = torch.arange(len(valid), dtype=torch.int32, device=self.device)
         elastic_info = torch.cat([base_config, table1, table2], dim=0).to(torch.int32)
