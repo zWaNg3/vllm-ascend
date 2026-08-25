@@ -118,6 +118,7 @@ from vllm_ascend.utils import (
     setup_ascend_local_comm_res,
     vllm_version_is,
 )
+from vllm_ascend.worker.sentinel.npu_worker_sentinel import WorkerSentinel, fault_barrier_wrapper
 
 # vLLM #61183 moved the planning helpers on main; v0.32.0 keeps them
 # in kv_cache_utils, so importing the main-only module breaks worker startup.
@@ -132,7 +133,6 @@ else:
         unify_hybrid_kv_cache_specs,
     )
 
-from vllm_ascend.worker.sentinel.npu_worker_sentinel import WorkerSentinel
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -913,6 +913,7 @@ class NPUWorker(WorkerBase):
             self.torch_allocated / GiB_bytes,
         )
 
+    @fault_barrier_wrapper
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -984,6 +985,7 @@ class NPUWorker(WorkerBase):
         return output
 
     @torch.inference_mode()
+    @fault_barrier_wrapper
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
         output = self.model_runner.sample_tokens(grammar_output)
         _attach_profiling_chunk_execution_time(
