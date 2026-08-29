@@ -1025,8 +1025,6 @@ runner_mapping:
     default: a3-8
   tests/e2e/pull_request/sixteen_card:
     default: a3-16
-  tests/e2e/fault_tolerance:
-    default: a3_x4
   tests/ut/.+/a3_2:
     default: a3-2
   tests/ut/.+/a2:
