@@ -150,12 +150,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         # as an explicit elastic_info tensor on every call; dead ranks are
         # excluded purely via elastic_info.
         self._ft_enabled = vllm_config.parallel_config.enable_fault_tolerance
-        if self._ft_enabled:
-            if not self.enable_dispatch_v2:
-                raise RuntimeError(
-                    "MC2 fault tolerance requires npu_moe_distribute_dispatch_v2 "
-                    "(aclnn V3+), please upgrade your CANN/torch_npu version."
-                )
 
     def refresh_hccl_group(self) -> None:
         """Refresh MC2 communicator metadata after HCCL groups are recreated."""
