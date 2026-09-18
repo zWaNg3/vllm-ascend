@@ -512,9 +512,7 @@ def reload_experts_from_disk(
             f"[FT] {len(unmatched)} (layer, expert) pair(s) had no matching "
             f"checkpoint weight, e.g. {unmatched[:5]}. The model's expert "
             "weights likely use a layout that does not follow "
-            "'<layer_name>.<expert_id>.' (e.g. fused experts), or the "
-            "checkpoint's naming differs from the runtime namespace without "
-            "an hf_to_vllm_mapper declared on the model class."
+            "'<layer_name>.<expert_id>.' (e.g. fused experts)."
         )
 
     reloaded = _reload_batched(routed_layers, local_slots, buckets)
