@@ -25,6 +25,8 @@ from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loade
 from vllm.v1.worker.sentinel.eplb_redistribute import (
     compute_dead_ep_ranks,
     mark_dead_expert_slots_inplace,
+    rebuild_logical_expert_maps,
+    rebuild_model_expert_maps,
     redistribute_expert_placement,
 )
 
@@ -40,8 +42,11 @@ __all__ = [
     "compute_dead_ep_ranks",
     "densify_routing_table_physical_ids",
     "mark_dead_expert_slots_inplace",
+    "rebuild_logical_expert_maps",
+    "rebuild_model_expert_maps",
     "redistribute_expert_placement",
     "reload_experts_from_disk",
+    "reload_draft_experts_from_disk",
 ]
 
 # Checkpoint name suffixes (relative to "<layer_name>.<expert_id>.") of the
@@ -496,4 +501,96 @@ def reload_experts_from_disk(
     reloaded = _reload_batched(routed_layers, local_slots, buckets)
 
     logger.info("[FT] Expert weight reload complete: %d (layer, slot) pair(s).", reloaded)
+    return reloaded
+
+
+_MT_SUFFIX_TO_BUCKET = {
+    "w1.weight": "gate_proj.weight",
+    "w3.weight": "up_proj.weight",
+    "w2.weight": "down_proj.weight",
+    "w1.weight_scale": "gate_proj.weight_scale",
+    "w3.weight_scale": "up_proj.weight_scale",
+    "w2.weight_scale": "down_proj.weight_scale",
+}
+_MT_WANTED_SUFFIXES = set(_MT_SUFFIX_TO_BUCKET)
+
+
+def reload_draft_experts_from_disk(
+    draft_model: torch.nn.Module,
+    vllm_config: VllmConfig,
+    reassignments: set[tuple[int, int]],
+    physical_to_logical_map: torch.Tensor,
+) -> int:
+    """Reload reassigned expert weights into the speculative drafter
+    model's local expert slots after scale-down."""
+    if not reassignments:
+        return 0
+
+    ep_group = get_ep_group()
+    ep_rank = ep_group.rank_in_group
+    ep_size = ep_group.world_size
+    num_local = physical_to_logical_map.shape[1] // ep_size
+    p2l_row = physical_to_logical_map[0].cpu().tolist()
+    local_slots: dict[int, int] = {}
+    for lid in sorted({lid for _, lid in reassignments}):
+        for local_idx in range(num_local):
+            if p2l_row[ep_rank * num_local + local_idx] == lid:
+                local_slots[lid] = local_idx
+                break
+    if not local_slots:
+        return 0
+
+
+    moe_layers = [
+        getattr(layer, "routed_experts", layer) for layer in draft_model.moe_layers
+    ]
+
+    loader = DefaultModelLoader(vllm_config.load_config)
+    loader.local_expert_ids = None
+
+    all_weights = loader.get_all_weights(vllm_config.model_config, draft_model)
+
+    buckets: dict[int, dict[int, dict[str, torch.Tensor]]] = {}
+    matched_by_layer: dict[int, set[int]] = {k: set() for k in range(len(moe_layers))}
+    for name, tensor in all_weights:
+        if ".ffn.experts." not in name:
+            continue
+        head, tail = name.rsplit(".ffn.experts.", 1)
+        if not head.startswith("mtp."):
+            continue
+        try:
+            k = int(head.split(".", 1)[1])
+        except (ValueError, IndexError):
+            continue
+        if k >= len(moe_layers):
+            continue
+        exp_part, suffix = tail.split(".", 1)
+        try:
+            eid = int(exp_part)
+        except ValueError:
+            continue
+        if eid not in local_slots or suffix not in _MT_WANTED_SUFFIXES:
+            continue
+        matched_by_layer[k].add(eid)
+        buckets.setdefault(k, {}).setdefault(eid, {})[
+            _MT_SUFFIX_TO_BUCKET[suffix]
+        ] = tensor
+
+    unmatched = sorted(set(local_slots) - (matched_by_layer[0] if buckets else set()))
+    if unmatched:
+        raise RuntimeError(
+            f"[FT] {len(unmatched)} MTP drafter (layer, expert) pair(s) had "
+            f"no matching checkpoint weight, e.g. {unmatched[:5]}. The draft "
+            "model's expert weights likely use an unexpected checkpoint layout."
+        )
+
+    local_slots_by_layer: dict[tuple[int, int], int] = {}
+    reload_buckets: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
+    for k, layer_buckets in buckets.items():
+        for eid, slot in local_slots.items():
+            local_slots_by_layer[(k, eid)] = slot
+            reload_buckets[(k, eid)] = layer_buckets[eid]
+    reloaded = _reload_batched(moe_layers, local_slots_by_layer, reload_buckets)
+
+    logger.info("[FT] MTP drafter expert weight reload complete: %d (expert, layer, slot).", reloaded)
     return reloaded

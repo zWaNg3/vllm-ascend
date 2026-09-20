@@ -21,6 +21,11 @@ from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.worker.sentinel.eplb_redistribute import (
     build_orig_to_dense_rank_table,
     densify_routing_table_physical_ids,
+    mark_dead_expert_slots_inplace,
+    rebuild_logical_expert_maps,
+    rebuild_model_expert_maps,
+    redistribute_expert_placement,
+    reload_draft_experts_from_disk,
     reload_experts_from_disk,
 )
 
@@ -160,6 +165,16 @@ class WorkerSentinel(GPUWorkerSentinel):
         top of that, refreshes the Ascend kernel-facing routing tables into the
         densified id space and shrinks the MC2 physical-expert width.
         """
+        # Precompute the reassignment set up front: super()._redistribute_experts
+        eplb_model_state = self._eplb_model_state()
+        p2l = eplb_model_state.physical_to_logical_map
+        ep_world_size = get_ep_group().world_size
+        num_local_experts = p2l.shape[1] // ep_world_size
+        num_logical = eplb_model_state.logical_replica_count.shape[1]
+        scratch = p2l.detach().clone()
+        mark_dead_expert_slots_inplace(scratch, dead_ep_ranks, num_local_experts)
+        reassignments = redistribute_expert_placement(scratch, num_logical, num_local_experts)
+
         super()._redistribute_experts(dead_ep_ranks)
 
         eplb_model_state = self._eplb_model_state()
@@ -168,6 +183,56 @@ class WorkerSentinel(GPUWorkerSentinel):
         # their ids into the densified space for the MC2 kernels.
         refresh_model_routing_tables(eplb_model_state)
         self._densify_routing_tables(eplb_model_state)
+
+        # The speculative drafter(MTP/DSpark) keeps independent EPLB layer
+        # states / routing tables and expert weights, sharing the main model's
+        # placement; scale down bypasses it, so its tables stay stale (still
+        # referencing dead ranks' physical ids). Re-sync them to the new
+        # redistributed placement and reload the re-hosted expert weights.
+        draft_model = getattr(self.worker.model_runner, "speculator", None)
+        draft_model = getattr(draft_model, "model", None)
+        if draft_model is not None and getattr(draft_model, "moe_layers", None):
+            self._sync_drafter_eplb(draft_model, eplb_model_state.physical_to_logical_map, reassignments)
+
+    def _sync_drafter_eplb(
+        self,
+        draft_model,
+        p2l: torch.Tensor,
+        reassignments: set[tuple[int, int]],
+    ) -> None:
+        """Re-sync the speculative drafter's EPLB routing and expert weights
+        after scale-down
+        """
+        num_draft_layers = len(draft_model.moe_layers)
+
+        draft_p2l = p2l[:num_draft_layers]
+        ep_world_size = get_ep_group().world_size
+        num_local_experts = p2l.shape[1] // ep_world_size
+        active_mask = get_ep_all2all_manager().query_active_mask()
+        dead_ranks = {rank for rank, is_dead in enumerate(active_mask.tolist()) if is_dead}
+        orig_to_dense = build_orig_to_dense_rank_table(ep_world_size, dead_ranks)
+
+        for layer in draft_model.moe_layers:
+            layer_state = getattr(layer, "eplb_state", None)
+            if layer_state is None:
+                continue
+
+            rebuild_logical_expert_maps(
+                draft_p2l[:1],
+                layer_state.logical_to_physical_map[None],
+                layer_state.logical_replica_count[None],
+            )
+            layer_state.refresh_expert_replica_routing_table()
+            routing_table = layer_state.expert_replica_routing_table
+            if routing_table is not None:
+                densify_routing_table_physical_ids(routing_table, orig_to_dense, num_local_experts)
+
+            # v2 model-side expert map
+            rebuild_model_expert_maps(draft_model, draft_p2l)
+
+            # Reload the re-hosted experts into the drafter's independent weight
+            reload_draft_experts_from_disk(draft_model, self.worker.vllm_config, reassignments, p2l)
+
 
     def _densify_routing_tables(self, eplb_model_state) -> None:
         """Renumber the kernel-facing routing tables into the densified id space.
