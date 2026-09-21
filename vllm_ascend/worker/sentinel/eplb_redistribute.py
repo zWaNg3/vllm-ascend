@@ -478,7 +478,11 @@ def reload_experts_from_disk(
     if not local_slots:
         return 0
 
-    normalize = _get_ckpt_name_normalizer(model)
+    prefixes: dict[str, tuple[int, int]] = {
+        f"{routed_layers[layer_idx].layer_name}.{logical_id}.": (layer_idx, logical_id)
+        for layer_idx, logical_id in local_slots
+    }
+    normalize = _get_ckpt_name_mapper(model)
 
     # "<layer_name>.<expert_id>" -> key for O(1) matching.
     wanted: dict[str, dict[int, tuple[int, int]]] = {}
@@ -506,8 +510,11 @@ def reload_experts_from_disk(
     if unmatched:
         raise RuntimeError(
             f"[FT] {len(unmatched)} (layer, expert) pair(s) had no matching "
-            f"checkpoint weight, e.g. {unmatched[:5]}. The expert weight names "
-            "likely do not follow '<layer_name>.<expert_id>.' (e.g. fused experts)."
+            f"checkpoint weight, e.g. {unmatched[:5]}. The model's expert "
+            "weights likely use a layout that does not follow "
+            "'<layer_name>.<expert_id>.' (e.g. fused experts), or the "
+            "checkpoint's naming differs from the runtime namespace without "
+            "an hf_to_vllm_mapper declared on the model class."
         )
 
     reloaded = _reload_batched(routed_layers, local_slots, buckets)
