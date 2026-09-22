@@ -494,7 +494,18 @@ def reload_experts_from_disk(
     wanted_suffixes.add(_W2_SCALE_SUFFIX)
 
     buckets: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
-    matched: set[tuple[int, int]] = set()
+    matched: set[str] = set()
+
+    def filtered_iter() -> Generator[tuple[tuple[int, int], str, torch.Tensor], None, None]:
+        for raw_name, tensor in all_weights:
+            name = normalize(raw_name)
+            for prefix, key in prefixes.items():
+                if name.startswith(prefix):
+                    matched.add(prefix)
+                    suffix = name[len(prefix) :]
+                    if suffix in wanted_suffixes:
+                        yield key, suffix, tensor
+                    break
 
     logger.info("[FT] Reloading %d reassigned (layer, expert) pair(s) on this rank from disk.", len(local_slots))
     shards = _resolve_safetensors_shards(vllm_config, model)
