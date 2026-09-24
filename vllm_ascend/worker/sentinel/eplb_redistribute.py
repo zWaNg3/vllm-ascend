@@ -33,6 +33,7 @@ from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import (
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
 
 __all__ = [
+    "DRAFTER_SUFFIX_MAP",
     "build_orig_to_dense_rank_table",
     "densify_routing_table_physical_ids",
     "reload_experts_from_disk",
@@ -45,6 +46,20 @@ _W13_WEIGHT_SUFFIXES = ("gate_up_proj.weight", "gate_proj.weight", "up_proj.weig
 _W2_WEIGHT_SUFFIX = "down_proj.weight"
 _W13_SCALE_SUFFIXES = ("gate_up_proj.weight_scale", "gate_proj.weight_scale", "up_proj.weight_scale")
 _W2_SCALE_SUFFIX = "down_proj.weight_scale"
+
+# Speculative drafters (MTP/DSpark) hold the same projection tensors as the
+# main model but their checkpoints name them w1/w3 (gate/up) and w2 (down).
+# Translate those onto the bucket names the reloaders consume, so a drafter
+# reload reuses the whole main-model path unchanged: pass this as
+# ``suffix_map`` to ``reload_experts_from_disk``.
+DRAFTER_SUFFIX_MAP = {
+    "w1.weight": "gate_proj.weight",
+    "w3.weight": "up_proj.weight",
+    "w2.weight": "down_proj.weight",
+    "w1.weight_scale": "gate_proj.weight_scale",
+    "w3.weight_scale": "up_proj.weight_scale",
+    "w2.weight_scale": "down_proj.weight_scale",
+}
 
 # Quant schemes the reload supports (gated in _reload_local_slots).
 _SUPPORTED_QUANT_TYPES = {
@@ -398,12 +413,17 @@ def _collect_matching_weights(
     wanted_suffixes: set[str],
     buckets: dict[tuple[int, int], dict[str, torch.Tensor]],
     matched: set[tuple[int, int]],
+    suffix_map: dict[str, str] | None = None,
 ) -> None:
     """Read only the wanted experts' tensors by walking safetensors shard headers.
 
     ``safe_open(...).keys()`` reads a shard's JSON header alone, so a name
     ``_resolve_expert_tensor`` rejects never reaches ``get_tensor``: reads are
     limited to the wanted experts plus one header per shard.
+
+    ``suffix_map`` renames a checkpoint suffix into the bucket name the
+    reloaders consume (drafters use ``w1/w3/w2``); unmapped suffixes are
+    skipped. ``None`` matches suffixes verbatim.
     """
     for st_file in shards:
         with safe_open(st_file, framework="pt") as f:
@@ -413,6 +433,10 @@ def _collect_matching_weights(
                     continue
                 key, suffix = found
                 matched.add(key)
+                if suffix_map is not None:
+                    suffix = suffix_map.get(suffix)
+                    if suffix is None:
+                        continue
                 if suffix in wanted_suffixes:
                     buckets.setdefault(key, {})[suffix] = f.get_tensor(raw_name)
 
@@ -421,6 +445,7 @@ def reload_experts_from_disk(
     model: torch.nn.Module,
     vllm_config: VllmConfig,
     reassignments: set[tuple[int, int]],
+    suffix_map: dict[str, str] | None = None,
 ) -> int:
     """Reload reassigned (moe_layer_idx, logical_expert_id) weights from disk.
 
@@ -430,6 +455,13 @@ def reload_experts_from_disk(
     rank's physical block are reloaded, into the slot given by
     ``eplb_state.logical_to_physical_map`` -- hence the call must follow the
     upstream ``rebuild_model_expert_maps``.
+
+    ``suffix_map`` renames the checkpoint's projection suffixes onto the bucket
+    names above, for models whose checkpoint names them differently --
+    speculative drafters (MTP/DSpark) use ``w1/w3/w2``, so pass
+    ``DRAFTER_SUFFIX_MAP``. It is the only per-model difference: the layer
+    names, placement maps, shard selection and name mapper all come from
+    ``model``, so a drafter reload shares this path whole.
     """
     if not reassignments:
         return 0
@@ -477,7 +509,7 @@ def reload_experts_from_disk(
             "[FT] scale_down expert reload requires a safetensors checkpoint; "
             f"{vllm_config.model_config.model} has none."
         )
-    _collect_matching_weights(shards, normalize, wanted, wanted_suffixes, buckets, matched)
+    _collect_matching_weights(shards, normalize, wanted, wanted_suffixes, buckets, matched, suffix_map)
     # Same reasoning: a pair with no checkpoint weight would leave its slot
     # holding the previous occupant's weights.
     unmatched = [pair for pair in local_slots if pair not in matched]

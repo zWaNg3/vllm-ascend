@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch_npu
-from vllm.distributed.eplb.eplb_state import _commit_eplb_maps
+from vllm.distributed.eplb.eplb_state import EplbModelState, _commit_eplb_maps
 from vllm.distributed.parallel_state import (
     get_dp_group,
     get_ep_group,
@@ -15,6 +15,7 @@ from vllm.distributed.parallel_state import (
 from vllm.distributed.utils import set_gloo_backend_timeout
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.model_executor.models.interfaces import get_mixture_of_experts_model
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.worker.sentinel.eplb_redistribute import (
@@ -30,6 +31,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.eplb.state import refresh_model_routing_tables
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.worker.sentinel.eplb_redistribute import (
+    DRAFTER_SUFFIX_MAP,
     build_orig_to_dense_rank_table,
     densify_routing_table_physical_ids,
     reload_experts_from_disk,
@@ -183,36 +185,82 @@ class WorkerSentinel(GPUWorkerSentinel):
         dead slots, steal spare slots, rebuild the logical maps) are kept; on
         top of that, refreshes the Ascend kernel-facing routing tables into
         the densified id space and shrinks the MC2 physical-expert width.
+
+        Each EPLB-registered model is redistributed against its own placement:
+        ``redistribute_expert_placement`` reports the pairs needing a reload
+        *relative to the placement it is given*, so no model may borrow another's
+        result. They start out equal, but async EPLB rebalances each model state
+        independently.
         """
         model_runner = self.worker.model_runner
-        eplb_model_state = self._eplb_model_state()
 
-        p2l = eplb_model_state.physical_to_logical_map
-        num_logical = eplb_model_state.logical_replica_count.shape[1]
+        models: list[tuple[torch.nn.Module, EplbModelState, dict[str, str] | None]] = [
+            (model_runner.model, self._eplb_model_state(), None)
+        ]
+        drafter = self._registered_drafter(model_runner)
+        if drafter is not None:
+            draft_model, draft_state = drafter
+            models.append((draft_model, draft_state, DRAFTER_SUFFIX_MAP))
+
         ep_world_size = get_ep_group().world_size
-        num_local_experts = p2l.shape[1] // ep_world_size
+        for model, model_state, suffix_map in models:
+            p2l = model_state.physical_to_logical_map
+            num_logical = model_state.logical_replica_count.shape[1]
+            num_local_experts = p2l.shape[1] // ep_world_size
 
-        mark_dead_expert_slots_inplace(p2l, dead_ep_ranks, num_local_experts)
-        reassignments = redistribute_expert_placement(p2l, num_logical, num_local_experts)
-        # p2l was updated in place; the commit derives l2p/lrc from it.
-        _commit_eplb_maps(eplb_model_state, p2l.cpu())
-        rebuild_model_expert_maps(model_runner.model, p2l, num_local_experts)
+            # Both mutate p2l in place; the apply below derives l2p/lrc from it.
+            mark_dead_expert_slots_inplace(p2l, dead_ep_ranks, num_local_experts)
+            reassignments = redistribute_expert_placement(p2l, num_logical, num_local_experts)
 
+            logger.info(
+                "[FT] %s expert redistribution: moe_layers=%d, num_logical=%d, reassignments=%d",
+                type(model).__name__,
+                p2l.shape[0],
+                num_logical,
+                len(reassignments),
+            )
+            self._apply_placement(model, model_state, reassignments, suffix_map=suffix_map)
+
+    def _apply_placement(
+        self,
+        model: torch.nn.Module,
+        model_state: EplbModelState,
+        reassignments: set[tuple[int, int]],
+        suffix_map: dict[str, str] | None = None,
+    ) -> None:
+        """Make a model's already-redistributed placement live.
+
+        Reads the placement from ``model_state``, so it is always that model's
+        own. Every update is in place, so captured graphs stay valid. The
+        per-layer ``AscendEplbLayerState`` tensors are views of the committed
+        maps, so one commit reaches all of that model's layers.
+        """
+        p2l = model_state.physical_to_logical_map
+        num_local_experts = p2l.shape[1] // get_ep_group().world_size
+
+        _commit_eplb_maps(model_state, p2l.cpu())
+        rebuild_model_expert_maps(model, p2l, num_local_experts)
         if reassignments:
-            reload_experts_from_disk(model_runner.model, self.worker.vllm_config, reassignments)
+            reload_experts_from_disk(model, self.worker.vllm_config, reassignments, suffix_map=suffix_map)
+        refresh_model_routing_tables(model_state)
+        self._densify_routing_tables(model_state)
 
-        logger.info(
-            "[FT] Expert redistribution: num_logical=%d, ep_world_size=%d, reassignments=%d",
-            num_logical,
-            ep_world_size,
-            len(reassignments),
+    def _registered_drafter(self, model_runner) -> tuple[torch.nn.Module, EplbModelState] | None:
+        """Return the speculative drafter and its EPLB state, if EPLB has one."""
+        draft_model = getattr(getattr(model_runner, "speculator", None), "model", None)
+        # The predicate maybe_register_speculator itself gates on: EPLB registers
+        # a MoE drafter only. Keying off moe_layers would admit DeepSeekV4MTP,
+        # which never reports num_moe_layers and so was never registered.
+        draft_moe = get_mixture_of_experts_model(draft_model)
+        if draft_moe is None:
+            return None
+        for model_state in model_runner.eplb_state.model_states.values():
+            if model_state.model is draft_moe:
+                return draft_model, model_state
+        raise RuntimeError(
+            "[FT] the drafter is a MoE model and EPLB accepted it at load, but has no model "
+            "state for it now; its placement would keep pointing at dead ranks."
         )
-
-        # Propagate the new placement into the Ascend routing tables (in-place,
-        # so captured graphs keep pointing at valid storage), then renumber
-        # their ids into the densified space for the MC2 kernels.
-        refresh_model_routing_tables(eplb_model_state)
-        self._densify_routing_tables(eplb_model_state)
 
     def _densify_routing_tables(self, eplb_model_state) -> None:
         """Renumber the kernel-facing routing tables into the densified id space.
