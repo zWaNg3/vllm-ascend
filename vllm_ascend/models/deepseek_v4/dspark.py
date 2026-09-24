@@ -337,6 +337,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts, Support
                 self.moe_layers.append(layer.mlp.experts)
 
         self.extract_moe_parameters(example_moe)
+        # EPLB identifies a MoE model via num_moe_layers > 0
+        self.num_moe_layers = len(self.moe_layers)
 
     def forward(
         self,
