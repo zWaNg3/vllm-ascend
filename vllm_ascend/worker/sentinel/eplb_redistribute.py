@@ -33,10 +33,25 @@ from vllm_ascend.worker.sentinel.eplb_quant_schemes import (
 )
 
 __all__ = [
+    "DRAFTER_SUFFIX_MAP",
     "build_orig_to_dense_rank_table",
     "densify_routing_table_physical_ids",
     "reload_experts_from_disk",
 ]
+
+# Speculative drafters (MTP/DSpark) hold the same projection tensors as the
+# main model but their checkpoints name them w1/w3 (gate/up) and w2 (down).
+# Translate those onto the bucket names the reloaders consume, so a drafter
+# reload reuses the whole main-model path unchanged: pass this as
+# ``suffix_map`` to ``reload_experts_from_disk``.
+DRAFTER_SUFFIX_MAP = {
+    "w1.weight": "gate_proj.weight",
+    "w3.weight": "up_proj.weight",
+    "w2.weight": "down_proj.weight",
+    "w1.weight_scale": "gate_proj.weight_scale",
+    "w3.weight_scale": "up_proj.weight_scale",
+    "w2.weight_scale": "down_proj.weight_scale",
+}
 
 # (layer, expert) pairs per chunk: bigger chunks amortise device rounds but grow the stacked buffer.
 _RELOAD_CHUNK_SIZE = 32
@@ -246,11 +261,16 @@ def _collect_matching_weights(
     wanted_suffixes: Set[str],
     expert_weights: dict[tuple[int, int], dict[str, torch.Tensor]],
     matched: set[tuple[int, int]],
+    suffix_map: dict[str, str] | None = None,
 ) -> None:
     """Read only the wanted experts' tensors by walking shard headers.
 
     ``safe_open(...).keys()`` reads just the JSON header, so rejected names
     never reach ``get_tensor``: reads stay limited to the wanted experts.
+
+    ``suffix_map`` renames a checkpoint suffix into the bucket name the
+    reloaders consume (drafters use ``w1/w3/w2``); unmapped suffixes are
+    skipped. ``None`` matches suffixes verbatim.
     """
     for st_file in shards:
         with safe_open(st_file, framework="pt") as f:
@@ -260,6 +280,10 @@ def _collect_matching_weights(
                     continue
                 key, suffix = found
                 matched.add(key)
+                if suffix_map is not None:
+                    suffix = suffix_map.get(suffix)
+                    if suffix is None:
+                        continue
                 if suffix in wanted_suffixes:
                     expert_weights.setdefault(key, {})[suffix] = f.get_tensor(raw_name)
 
@@ -268,6 +292,7 @@ def reload_experts_from_disk(
     model: torch.nn.Module,
     vllm_config: VllmConfig,
     reassignments: set[tuple[int, int]],
+    suffix_map: dict[str, str] | None = None,
 ) -> int:
     """Reload reassigned (moe_layer_idx, logical_expert_id) weights from disk.
 
@@ -276,6 +301,13 @@ def reload_experts_from_disk(
     back. Only experts landing in this rank's physical block are reloaded, into
     the slot from ``eplb_state.logical_to_physical_map``; the call must follow
     ``rebuild_model_expert_maps``.
+
+    ``suffix_map`` renames the checkpoint's projection suffixes onto the bucket
+    names above, for models whose checkpoint names them differently --
+    speculative drafters (MTP/DSpark) use ``w1/w3/w2``, so pass
+    ``DRAFTER_SUFFIX_MAP``. It is the only per-model difference: the layer
+    names, placement maps, shard selection and name mapper all come from
+    ``model``, so a drafter reload shares this path whole.
     """
     if not reassignments:
         return 0
@@ -319,7 +351,7 @@ def reload_experts_from_disk(
             "[FT] scale_down expert reload requires a safetensors checkpoint; "
             f"{vllm_config.model_config.model} has none."
         )
-    _collect_matching_weights(shards, name_mapper, wanted, _WANTED_SUFFIXES, expert_weights, matched)
+    _collect_matching_weights(shards, name_mapper, wanted, _WANTED_SUFFIXES, expert_weights, matched, suffix_map)
     # A pair with no checkpoint weight would silently keep its slot's previous occupant, so fail.
     unmatched = [layer_expert for layer_expert in local_slots if layer_expert not in matched]
     if unmatched:
