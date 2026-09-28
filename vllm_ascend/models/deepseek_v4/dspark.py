@@ -40,6 +40,7 @@ from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix, proce
 
 from vllm_ascend.models.common.ops.sequence_parallel import sp_padding_mask, sp_shard
 from vllm_ascend.models.deepseek_v4.model import (
+    AscendDeepseekV4ForCausalLM,
     DeepseekV2MixtureOfExperts,
     DeepseekV4DecoderLayer,
     DeepseekV4MoE,
@@ -95,7 +96,10 @@ class DeepseekV4DSparkModel(nn.Module):
             {
                 str(self.mtp_start_layer_idx + idx): DeepseekV4DecoderLayer(
                     vllm_config,
-                    prefix=f"mtp.{idx}",
+                    # Keep the parent prefix: the mapper rewrites the checkpoint's
+                    # "mtp.N" keys to "model.mtp.N", and both the quant
+                    # description and the FT expert reload are keyed by that.
+                    prefix=maybe_prefix(prefix, f"mtp.{idx}"),
                     is_draft_layer=True,
                 )
                 for idx in range(self.num_dspark_layers)
@@ -297,6 +301,13 @@ class DeepseekV4DSparkModel(nn.Module):
 
 @support_torch_compile
 class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts, SupportsEagle3):
+    # The draft lives in the target's checkpoint, so it shares the target's
+    # mapper: the quant config rewrites the shared quant description with it,
+    # and the FT expert reload normalises checkpoint names with it before they
+    # are matched against ``FusedMoE.layer_name``. Reuse the instance rather
+    # than an equal copy, so both classes can never drift apart.
+    hf_to_vllm_mapper = AscendDeepseekV4ForCausalLM.hf_to_vllm_mapper
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
