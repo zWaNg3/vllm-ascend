@@ -179,6 +179,13 @@ QUANT_MODEL_PREFIX_MAPPINGS = {
         # quantization lookup also queries the module prefix itself.
         "language_model.lm_head": "lm_head",
         "layers.": "model.layers.",
+        # The MTP/DSpark draft block keeps the checkpoint's raw ``mtp.{i}``
+        # module prefix (see dspark.py / mtp.py), but its description keys went
+        # through ``apply_vllm_mapper``, whose ``^(?!model)`` rule roots every
+        # key at ``model.`` -- including the untouched ``mtp.*`` region. Without
+        # this rule the draft queries ``mtp.0.mlp.*`` while the description
+        # holds ``model.mtp.0.mlp.*``, so its packed modules raise KeyError.
+        "mtp.": "model.mtp.",
         "embed.": "model.embed_tokens.",
         "head.": "lm_head.",
     },

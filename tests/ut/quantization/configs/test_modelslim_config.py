@@ -737,6 +737,25 @@ class TestQuantPrefixMapper(TestBase):
                     expected,
                 )
 
+    def test_deepseek_v4_mtp_maps_to_the_model_rooted_description(self):
+        """The MTP/DSpark draft queries the raw ``mtp.`` namespace.
+
+        ``apply_vllm_mapper`` roots every description key at ``model.`` -- the
+        ``mtp.*`` region included -- while dspark.py / mtp.py keep the
+        checkpoint's ``mtp.{i}`` module prefix, so the lookup must add the root.
+        """
+        config = AscendModelSlimConfig({"model.mtp.0.mlp.shared_experts.gate_proj.weight": "W8A8_DYNAMIC"})
+        cases = {
+            "mtp.0.mlp.shared_experts.gate_proj": "model.mtp.0.mlp.shared_experts.gate_proj",
+            "mtp.0.mlp.experts.0.gate_proj": "model.mtp.0.mlp.experts.0.gate_proj",
+            "mtp.0.self_attn.wq_a": "model.mtp.0.self_attn.wq_a",
+            # Already rooted prefixes must stay put.
+            "model.mtp.0.mlp.shared_experts.gate_proj": "model.mtp.0.mlp.shared_experts.gate_proj",
+        }
+        for prefix, expected in cases.items():
+            with self.subTest(prefix=prefix):
+                self.assertEqual(config.quant_prefix_mapper("deepseek_v4", prefix), expected)
+
     def test_deepseek_v41_vision_maps_wrapped_language_model_prefixes(self):
         config = AscendModelSlimConfig(
             {
