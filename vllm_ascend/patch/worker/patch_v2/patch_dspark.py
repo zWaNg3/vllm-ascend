@@ -29,6 +29,13 @@ DSpark supports two kinds of drafts:
   (the draft linear layers lack the ``weight_offset``/``weight_scale``/
   ``scale_bias`` params the checkpoint ships), failing with a KeyError.
 
+A same-checkpoint draft must also mirror the target's expert layout. The Ascend
+drafter reports ``num_moe_layers``, so EPLB registers it into the target's
+``EplbState``, which requires every registered model to share one expert
+geometry; upstream's draft parallel config zeroes ``enable_eplb`` and
+``num_redundant_experts``, so the target's EPLB settings are carried onto the
+draft config before the draft model is built.
+
 The same-checkpoint fix is a general one; a long-term plan exists to contribute
 it upstream to ``load_dspark_model``.
 """
@@ -43,6 +50,7 @@ import vllm.model_executor.models.utils as model_utils
 import vllm.v1.worker.gpu.spec_decode.dspark.speculator as speculator_module
 import vllm.v1.worker.gpu.spec_decode.dspark.utils as dspark_utils
 import vllm.v1.worker.gpu.spec_decode.eagle.utils as eagle_utils
+from vllm.config import replace
 from vllm.distributed.parallel_state import get_pp_group
 
 from vllm_ascend.worker.v2.pp_transport import (
@@ -52,6 +60,7 @@ from vllm_ascend.worker.v2.pp_transport import (
 )
 
 _original_get_draft_quant_config = model_utils.get_draft_quant_config
+_original_get_dspark_parallel_config = dspark_utils._get_dspark_parallel_config
 _original_load_dspark_model = dspark_utils.load_dspark_model
 _original_maybe_share_target_embed = eagle_utils.maybe_share_target_embed
 
@@ -68,6 +77,28 @@ def _pp_safe_maybe_share_target_embed(draft_model, draft_inner, target_inner):
     if target_embed is None and get_pp_group().world_size > 1 and hasattr(draft_model, "post_process"):
         return
     return _original_maybe_share_target_embed(draft_model, draft_inner, target_inner)
+
+
+def _get_dspark_parallel_config_inheriting_eplb(parallel_config, tensor_parallel_size):
+    """Keep the target's EPLB settings on a same-checkpoint DSpark draft.
+
+    Upstream zeroes ``enable_eplb`` and ``num_redundant_experts`` so that the
+    draft never joins the target's ``EplbState``. The Ascend drafter does: it
+    reports ``num_moe_layers``, which is the predicate ``maybe_register_speculator``
+    gates on, so EPLB registers it. ``EplbState.validate_ep_configuration`` then
+    requires every registered model to share one expert geometry
+    (num_routed / num_redundant / num_physical / num_logical / num_expert_groups),
+    and the zeroed draft config builds 256 physical experts where the target has
+    384, so the target's own registration fails right after the draft's.
+    """
+    draft_parallel_config = _original_get_dspark_parallel_config(parallel_config, tensor_parallel_size)
+    if not parallel_config.enable_eplb:
+        return draft_parallel_config
+    return replace(
+        draft_parallel_config,
+        enable_eplb=parallel_config.enable_eplb,
+        eplb_config=parallel_config.eplb_config,
+    )
 
 
 def _load_dspark_model_with_target_quant(target_model, vllm_config):
@@ -101,6 +132,10 @@ def _load_dspark_model_with_target_quant(target_model, vllm_config):
         eagle_utils._should_share = should_share
     if inherits_target_quant:
         model_utils.get_draft_quant_config = lambda _vllm_config: vllm_config.quant_config
+        # Same-checkpoint drafts reuse the target's weights, so they must reuse
+        # its expert layout too: EPLB registers the drafter into the target's
+        # EplbState, which requires one shared expert geometry.
+        dspark_utils._get_dspark_parallel_config = _get_dspark_parallel_config_inheriting_eplb
     eagle_utils.maybe_share_target_embed = _pp_safe_maybe_share_target_embed
     try:
         # Native draft loading already sets PP=1, but still reads the target's
@@ -114,6 +149,7 @@ def _load_dspark_model_with_target_quant(target_model, vllm_config):
         eagle_utils.maybe_share_target_embed = _original_maybe_share_target_embed
         if inherits_target_quant:
             model_utils.get_draft_quant_config = _original_get_draft_quant_config
+            dspark_utils._get_dspark_parallel_config = _original_get_dspark_parallel_config
         if bypass_pp_guard:
             eagle_utils._should_share = original_eagle_should_share
             dspark_utils.get_pp_group = original_get_pp_group
