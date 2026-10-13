@@ -212,8 +212,14 @@ def test_hixl_destructor_cleans_up_when_modules_are_unavailable(monkeypatch):
     communicator._engine = engine
     communicator._device = SimpleNamespace(type="npu", index=0)
     communicator._remote_engines = {1: "peer"}
-    communicator._registered_handles = [1, 2]
     communicator._remote_send_meta = {1: {}}
+    registration = eplb_communicator._HixlDeviceRegistration(engine, "192.0.2.1:12345")
+    registration.segments[(0, 1)] = 1
+    registration.segments[(2, 3)] = 2
+    registration.connected.add("peer")
+    registration.users = 1
+    eplb_communicator._HIXL_DEVICE_REGISTRATIONS[0] = registration
+    communicator._registration = registration
     monkeypatch.setattr(
         torch, "npu", SimpleNamespace(set_device=MagicMock(side_effect=RuntimeError("no device"))), raising=False
     )
@@ -225,3 +231,4 @@ def test_hixl_destructor_cleans_up_when_modules_are_unavailable(monkeypatch):
     assert engine.deregister_mem.call_count == 2
     engine.finalize.assert_called_once_with()
     assert communicator._engine is None
+    assert 0 not in eplb_communicator._HIXL_DEVICE_REGISTRATIONS

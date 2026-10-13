@@ -4,6 +4,7 @@
 """Ascend communicators for asynchronous EPLB."""
 
 import contextlib
+import threading
 import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -61,6 +62,32 @@ def _resolve_hixl_module() -> Any:
             "HIXL EPLB requires the official hixl Python package or a CANN toolkit providing libcann_hixl.so"
         ) from error
     return hixl_compat
+
+
+class _HixlDeviceRegistration:
+    """The shared HIXL engine and registration ledger for one NPU device.
+
+    HIXL dedupes memory registrations only within a single engine
+    (``HixlServer::RegisterMem`` checks the engine's own handles), while the
+    underlying hcomm registry is process-global: a second engine that
+    re-registers an allocator segment already registered by the first fails
+    with PARAM_INVALID. Every EPLB model (target and drafter) must therefore
+    share one engine per device. The ledger records which segments are
+    registered and which peers are connected, so a later communicator only
+    adds the missing state; ``users`` refcounts the communicators and the
+    last one tears the engine down.
+    """
+
+    def __init__(self, engine: Any, local_engine: str) -> None:
+        self.engine = engine
+        self.local_engine = local_engine
+        self.segments: dict[tuple[int, int], int] = {}
+        self.connected: set[str] = set()
+        self.users = 0
+
+
+_HIXL_DEVICE_REGISTRATIONS: dict[int, _HixlDeviceRegistration] = {}
+_HIXL_DEVICE_REGISTRATIONS_LOCK = threading.Lock()
 
 
 class AscendGlooEplbCommunicator(TorchDistGlooStagedEplbCommunicator):
@@ -148,7 +175,15 @@ class AscendGlooEplbCommunicator(TorchDistGlooStagedEplbCommunicator):
 
 
 class AscendHixlEplbCommunicator(EplbCommunicator):
-    """Read expert weights directly between registered NPU allocations."""
+    """Read expert weights directly between registered NPU allocations.
+
+    All communicators on one NPU device share a single HIXL engine (see
+    ``_HixlDeviceRegistration``): HIXL dedupes registrations per engine while
+    the underlying hcomm registry is process-global, so a second engine
+    re-registering an already-registered allocator segment fails. Transfers
+    are issued one model state at a time from the EPLB async worker, so the
+    shared engine is never driven concurrently.
+    """
 
     receiver_initiated = True
 
@@ -175,7 +210,7 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         self._device = first_tensor.device
         self._num_local_experts = first_tensor.shape[0] if len(first_tensors) == 1 else len(first_tensors)
         self._engine: Any | None = None
-        self._registered_handles: list[int] = []
+        self._registration: _HixlDeviceRegistration | None = None
         self._remote_engines: dict[int, str] = {}
         self._remote_send_meta: dict[int, dict[tuple[int, int], tuple[tuple[int, ...], int]]] = {}
         self._expert_to_src_row: list[dict[int, int]] | None = None
@@ -232,23 +267,44 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         expert_buffer: Sequence[Any],
     ) -> None:
         torch.npu.set_device(self._device)
-        self._engine = self._hixl.Hixl()
-        local_engine = join_host_port(get_ip(), get_open_port())
+        registration = self._acquire_device_registration()
+        self._registration = registration
+        self._engine = registration.engine
         try:
-            self._check_status(
-                self._engine.initialize(local_engine, {}),
-                "initialize",
-            )
             tensors = [
                 tensor for layer_views in all_expert_weights for tensor in self._iter_storage_tensors(layer_views)
             ]
             tensors.extend(self._iter_storage_tensors(expert_buffer))
             self._register_tensor_segments(tensors)
-            self._exchange_remote_state(local_engine, all_expert_weights)
+            self._exchange_remote_state(registration.local_engine, all_expert_weights)
             self._connect_peers()
         except Exception:
             self._close()
             raise
+
+    def _acquire_device_registration(self) -> _HixlDeviceRegistration:
+        """Return (creating if needed) the shared registration for this device."""
+        device_index = self._device.index
+        with _HIXL_DEVICE_REGISTRATIONS_LOCK:
+            registration = _HIXL_DEVICE_REGISTRATIONS.get(device_index)
+            if registration is None:
+                engine = self._hixl.Hixl()
+                local_engine = join_host_port(get_ip(), get_open_port())
+                try:
+                    self._check_status(
+                        engine.initialize(local_engine, {}),
+                        "initialize",
+                    )
+                except Exception:
+                    try:  # noqa: SIM105
+                        engine.finalize()
+                    except Exception:
+                        pass
+                    raise
+                registration = _HixlDeviceRegistration(engine, local_engine)
+                _HIXL_DEVICE_REGISTRATIONS[device_index] = registration
+            registration.users += 1
+            return registration
 
     def _register_tensor_segments(self, tensors: Sequence[torch.Tensor]) -> None:
         """Register the allocator segments holding the transferable tensors.
@@ -258,7 +314,14 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         so register whole segments instead: a segment is 2 MiB aligned, which
         is exactly the granularity a registration accepts, and transfers only
         ever touch expert slots named in the exchanged remote metadata.
+
+        Registration is deduplicated against the shared per-device ledger:
+        the engine behind it has already registered every segment held by an
+        earlier communicator, and re-registering one fails at the
+        process-global hcomm layer.
         """
+        registration = self._registration
+        assert registration is not None
         segments = sorted(
             {
                 (int(segment["address"]), int(segment["total_size"]))
@@ -282,29 +345,31 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
                 raise RuntimeError("HIXL EPLB allocator segments must be 2 MiB aligned")
             regions.add(segment)
         ordered_regions = sorted(regions)
-        if len(ordered_regions) > _HIXL_MAX_REGISTERED_REGIONS:
-            raise RuntimeError(
-                f"HIXL EPLB requires {len(ordered_regions)} memory registrations; "
-                f"the HIXL limit is {_HIXL_MAX_REGISTERED_REGIONS}"
-            )
-        if self._rank == 0:
-            registered_bytes = sum(size for _, size in ordered_regions)
-            logger.info(
-                "Registering %d NPU memory regions (%.2f GiB) for HIXL EPLB.",
-                len(ordered_regions),
-                registered_bytes / 1024**3,
-            )
-        for start, size in ordered_regions:
-            self._register_region(start, size)
+        with _HIXL_DEVICE_REGISTRATIONS_LOCK:
+            new_regions = [region for region in ordered_regions if region not in registration.segments]
+            if len(registration.segments) + len(new_regions) > _HIXL_MAX_REGISTERED_REGIONS:
+                raise RuntimeError(
+                    f"HIXL EPLB requires {len(registration.segments) + len(new_regions)} memory "
+                    f"registrations across its models; the HIXL limit is {_HIXL_MAX_REGISTERED_REGIONS}"
+                )
+            if self._rank == 0:
+                registered_bytes = sum(size for _, size in new_regions)
+                logger.info(
+                    "Registering %d NPU memory regions (%.2f GiB) for HIXL EPLB.",
+                    len(new_regions),
+                    registered_bytes / 1024**3,
+                )
+            for start, size in new_regions:
+                registration.segments[(start, size)] = self._register_region(start, size)
 
-    def _register_region(self, address: int, size: int) -> None:
+    def _register_region(self, address: int, size: int) -> int:
         assert self._engine is not None
         status, handle = self._engine.register_mem(
             self._hixl.MemDesc(address, size),
             self._hixl.MemType.MEM_DEVICE,
         )
         self._check_status(status, "register memory")
-        self._registered_handles.append(handle)
+        return handle
 
     def _exchange_remote_state(
         self,
@@ -347,13 +412,21 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
 
     def _connect_peers(self) -> None:
         assert self._engine is not None
+        registration = self._registration
+        assert registration is not None
         local_error: Exception | None = None
         for peer_rank, remote_engine in self._remote_engines.items():
+            with _HIXL_DEVICE_REGISTRATIONS_LOCK:
+                connected = remote_engine in registration.connected
+            if connected:
+                continue
             try:
                 self._check_status(
                     self._engine.connect(remote_engine, _TRANSFER_TIMEOUT_SECONDS * 1000),
                     f"connect to rank {peer_rank}",
                 )
+                with _HIXL_DEVICE_REGISTRATIONS_LOCK:
+                    registration.connected.add(remote_engine)
             except Exception as error:
                 local_error = local_error or error
         self._confirm_all_ranks(local_error, "connection")
@@ -501,32 +574,39 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         return False
 
     def _close(self) -> None:
-        engine = getattr(self, "_engine", None)
-        if engine is None:
-            return
+        registration = getattr(self, "_registration", None)
+        self._registration = None
         self._engine = None
+        self._remote_engines.clear()
+        self._remote_send_meta.clear()
+        if registration is None:
+            return
+        with _HIXL_DEVICE_REGISTRATIONS_LOCK:
+            registration.users -= 1
+            if registration.users > 0:
+                return
+            if _HIXL_DEVICE_REGISTRATIONS.get(self._device.index) is registration:
+                del _HIXL_DEVICE_REGISTRATIONS[self._device.index]
+        # Last user: tear the shared engine down.
         # contextlib may already be cleared during interpreter shutdown.
         try:  # noqa: SIM105
             torch.npu.set_device(self._device)
         except Exception:
             pass
-        for remote_engine in getattr(self, "_remote_engines", {}).values():
+        for remote_engine in registration.connected:
             try:  # noqa: SIM105
-                engine.disconnect(remote_engine)
+                registration.engine.disconnect(remote_engine)
             except Exception:
                 pass
-        for handle in reversed(getattr(self, "_registered_handles", [])):
+        for handle in reversed(list(registration.segments.values())):
             try:  # noqa: SIM105
-                engine.deregister_mem(handle)
+                registration.engine.deregister_mem(handle)
             except Exception:
                 pass
         try:  # noqa: SIM105
-            engine.finalize()
+            registration.engine.finalize()
         except Exception:
             pass
-        self._registered_handles.clear()
-        self._remote_engines.clear()
-        self._remote_send_meta.clear()
 
     def __del__(self) -> None:
         try:  # noqa: SIM105
