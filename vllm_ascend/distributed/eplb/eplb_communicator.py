@@ -354,18 +354,48 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         range subtraction: the engine behind it has already registered every
         range held by an earlier communicator, and the process-global hcomm
         layer rejects overlaps (not just identical ranges).
+
+        Every tensor is validated against the allocator snapshot: a weight
+        view with a corrupted shape would otherwise register a bogus
+        multi-TiB range and fail deep inside hcomm.
         """
         registration = self._registration
         assert registration is not None
+        segments = sorted(
+            {
+                (int(segment["address"]), int(segment["total_size"]))
+                for segment in torch.npu.memory_snapshot()
+                if segment.get("device") == self._device.index
+            }
+        )
         live_ranges = []
         for tensor in tensors:
             start = tensor.data_ptr()
             end = start + tensor.nbytes
+            segment = next(
+                (
+                    (address, size)
+                    for address, size in segments
+                    if address <= start and end <= address + size
+                ),
+                None,
+            )
+            if segment is None:
+                raise RuntimeError(
+                    "HIXL EPLB could not resolve an allocator segment for expert tensor "
+                    f"(shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+                    f"nbytes={tensor.nbytes}, data_ptr={start:#x})"
+                )
+            if segment[0] % _HIXL_MEMORY_ALIGNMENT or segment[1] % _HIXL_MEMORY_ALIGNMENT:
+                raise RuntimeError("HIXL EPLB allocator segments must be 2 MiB aligned")
             live_ranges.append(
                 (
                     start - start % _HIXL_MEMORY_ALIGNMENT,
-                    ((end + _HIXL_MEMORY_ALIGNMENT - 1) // _HIXL_MEMORY_ALIGNMENT)
-                    * _HIXL_MEMORY_ALIGNMENT,
+                    min(
+                        ((end + _HIXL_MEMORY_ALIGNMENT - 1) // _HIXL_MEMORY_ALIGNMENT)
+                        * _HIXL_MEMORY_ALIGNMENT,
+                        segment[0] + segment[1],
+                    ),
                 )
             )
         live_ranges.sort()

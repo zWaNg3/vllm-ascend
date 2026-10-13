@@ -94,10 +94,19 @@ def test_hixl_reads_registered_remote_expert(monkeypatch):
     monkeypatch.setitem(sys.modules, "hixl", _fake_hixl(engine))
     monkeypatch.setattr(eplb_communicator, "is_weak_contiguous", lambda _tensor: True)
     set_device = MagicMock()
+    memory_snapshot = MagicMock(
+        return_value=[
+            {
+                "device": 0,
+                "address": 0,
+                "total_size": 8_388_608,
+            }
+        ]
+    )
     monkeypatch.setattr(
         torch,
         "npu",
-        SimpleNamespace(set_device=set_device),
+        SimpleNamespace(set_device=set_device, memory_snapshot=memory_snapshot),
         raising=False,
     )
     monkeypatch.setattr(eplb_communicator, "get_ip", lambda: "192.0.2.1")
@@ -167,6 +176,7 @@ def test_hixl_reads_registered_remote_expert(monkeypatch):
         (5000, 13016, 16),
         (6100, 14200, 16),
     ]
+    assert memory_snapshot.call_count == 1
     assert work.wait.call_count == 2
     timing = communicator._eplb_hixl_phase_timings[0]
     assert (timing.request_count, timing.transfer_bytes) == (1, 32)
