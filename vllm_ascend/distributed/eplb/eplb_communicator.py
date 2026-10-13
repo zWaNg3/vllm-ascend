@@ -64,6 +64,38 @@ def _resolve_hixl_module() -> Any:
     return hixl_compat
 
 
+def _subtract_registered(
+    start: int,
+    size: int,
+    registered: Sequence[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Return the subranges of [start, start + size) not covered by ``registered``.
+
+    ``registered`` is sorted by address. The hcomm registry rejects overlaps,
+    not only identical ranges, and a segment's reported extent can grow
+    between two allocator snapshots, so exact-match dedupe is not enough.
+    Every address and size involved is 2 MiB aligned, so the uncovered
+    subranges stay aligned and are safe to register.
+    """
+    end = start + size
+    subregions: list[tuple[int, int]] = []
+    cursor = start
+    for reg_start, reg_size in registered:
+        reg_end = reg_start + reg_size
+        if reg_end <= cursor:
+            continue
+        if reg_start >= end:
+            break
+        if reg_start > cursor:
+            subregions.append((cursor, reg_start - cursor))
+        cursor = reg_end
+        if cursor >= end:
+            break
+    if cursor < end:
+        subregions.append((cursor, end - cursor))
+    return subregions
+
+
 class _HixlDeviceRegistration:
     """The shared HIXL engine and registration ledger for one NPU device.
 
@@ -315,10 +347,11 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         is exactly the granularity a registration accepts, and transfers only
         ever touch expert slots named in the exchanged remote metadata.
 
-        Registration is deduplicated against the shared per-device ledger:
-        the engine behind it has already registered every segment held by an
-        earlier communicator, and re-registering one fails at the
-        process-global hcomm layer.
+        Registration is deduplicated against the shared per-device ledger by
+        range subtraction: the engine behind it has already registered every
+        segment held by an earlier communicator, the process-global hcomm
+        layer rejects overlaps (not just identical ranges), and a segment's
+        reported extent can grow between two snapshots.
         """
         registration = self._registration
         assert registration is not None
@@ -346,7 +379,11 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
             regions.add(segment)
         ordered_regions = sorted(regions)
         with _HIXL_DEVICE_REGISTRATIONS_LOCK:
-            new_regions = [region for region in ordered_regions if region not in registration.segments]
+            new_regions = [
+                subregion
+                for start, size in ordered_regions
+                for subregion in _subtract_registered(start, size, sorted(registration.segments))
+            ]
             if len(registration.segments) + len(new_regions) > _HIXL_MAX_REGISTERED_REGIONS:
                 raise RuntimeError(
                     f"HIXL EPLB requires {len(registration.segments) + len(new_regions)} memory "
@@ -355,11 +392,14 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
             if self._rank == 0:
                 registered_bytes = sum(size for _, size in new_regions)
                 logger.info(
-                    "Registering %d NPU memory regions (%.2f GiB) for HIXL EPLB.",
+                    "Registering %d NPU memory regions (%.2f GiB) for HIXL EPLB "
+                    "(%d already registered).",
                     len(new_regions),
                     registered_bytes / 1024**3,
+                    len(registration.segments),
                 )
             for start, size in new_regions:
+                logger.debug("HIXL EPLB registering region (%#x, %d)", start, size)
                 registration.segments[(start, size)] = self._register_region(start, size)
 
     def _register_region(self, address: int, size: int) -> int:
@@ -368,7 +408,11 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
             self._hixl.MemDesc(address, size),
             self._hixl.MemType.MEM_DEVICE,
         )
-        self._check_status(status, "register memory")
+        if status != self._hixl.SUCCESS:
+            raise RuntimeError(
+                f"HIXL EPLB register memory failed with status {status} "
+                f"for region ({address:#x}, {size})"
+            )
         return handle
 
     def _exchange_remote_state(
