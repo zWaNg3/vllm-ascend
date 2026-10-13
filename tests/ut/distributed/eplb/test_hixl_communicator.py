@@ -26,6 +26,9 @@ class _Tensor:
     def is_contiguous(self):
         return True
 
+    def untyped_storage(self):
+        return SimpleNamespace(data_ptr=lambda: self._address, nbytes=self.nbytes)
+
 
 class _Engine:
     def __init__(self):

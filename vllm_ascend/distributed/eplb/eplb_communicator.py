@@ -338,6 +338,39 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
             registration.users += 1
             return registration
 
+    def _live_byte_range(self, tensor: torch.Tensor) -> tuple[int, int]:
+        """Return the tensor's real live byte range, clamped to its storage.
+
+        Some torch_npu weight-cast paths produce tensors whose sizes array
+        mirrors their own storage pointer (a corrupted TensorImpl), inflating
+        ``nbytes`` to TiB-scale values while ``data_ptr()`` stays real. The
+        storage keeps the real allocation extent, so clamp the range to it;
+        for the per-expert clones used here the storage extent is exact.
+        """
+        start = tensor.data_ptr()
+        end = start + tensor.nbytes
+        storage = tensor.untyped_storage()
+        storage_data_ptr = getattr(storage, "data_ptr", None)
+        if storage_data_ptr is None:
+            storage_data_ptr = start - tensor.storage_offset() * tensor.element_size()
+        storage_end = storage_data_ptr + storage.nbytes
+        if start < storage_data_ptr or start > storage_end:
+            raise RuntimeError(
+                f"HIXL EPLB expert tensor data_ptr {start:#x} falls outside its storage "
+                f"[{storage_data_ptr:#x}, {storage_end:#x})"
+            )
+        clamped_end = min(end, storage_end)
+        if clamped_end < end and self._rank == 0:
+            logger.warning(
+                "HIXL EPLB clamping expert tensor range to its storage: shape=%s, "
+                "dtype=%s, nbytes=%d, storage_nbytes=%d",
+                tuple(tensor.shape),
+                tensor.dtype,
+                tensor.nbytes,
+                storage.nbytes,
+            )
+        return start, clamped_end
+
     def _register_tensor_segments(self, tensors: Sequence[torch.Tensor]) -> None:
         """Register the 2 MiB units holding the transferable tensors.
 
@@ -370,8 +403,7 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         )
         live_ranges = []
         for tensor in tensors:
-            start = tensor.data_ptr()
-            end = start + tensor.nbytes
+            start, end = self._live_byte_range(tensor)
             segment = next(
                 (
                     (address, size)
@@ -453,10 +485,11 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
                 tensors = self._storage_tensors(view)
                 if len(tensors) == 1:
                     tensor = tensors[0]
-                    stride = tensor.nbytes // self._num_local_experts
-                    addresses = tuple(tensor.data_ptr() + slot * stride for slot in range(self._num_local_experts))
+                    start, end = self._live_byte_range(tensor)
+                    stride = (end - start) // self._num_local_experts
+                    addresses = tuple(start + slot * stride for slot in range(self._num_local_experts))
                 else:
-                    stride = tensors[0].nbytes
+                    stride = self._live_byte_range(tensors[0])[1] - tensors[0].data_ptr()
                     addresses = tuple(tensor.data_ptr() for tensor in tensors)
                 local_meta[(layer_idx, tensor_idx)] = addresses, stride
 
