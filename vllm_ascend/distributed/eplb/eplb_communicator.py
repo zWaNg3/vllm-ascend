@@ -351,9 +351,16 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         end = start + tensor.nbytes
         storage = tensor.untyped_storage()
         storage_data_ptr = getattr(storage, "data_ptr", None)
+        if callable(storage_data_ptr):
+            storage_data_ptr = storage_data_ptr()
         if storage_data_ptr is None:
             storage_data_ptr = start - tensor.storage_offset() * tensor.element_size()
-        storage_end = storage_data_ptr + storage.nbytes
+        storage_nbytes = getattr(storage, "nbytes", None)
+        if callable(storage_nbytes):
+            storage_nbytes = storage_nbytes()
+        if storage_nbytes is None:
+            raise RuntimeError(f"HIXL EPLB could not read the storage size of expert tensor {tuple(tensor.shape)}")
+        storage_end = storage_data_ptr + storage_nbytes
         if start < storage_data_ptr or start > storage_end:
             raise RuntimeError(
                 f"HIXL EPLB expert tensor data_ptr {start:#x} falls outside its storage "
@@ -367,7 +374,7 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
                 tuple(tensor.shape),
                 tensor.dtype,
                 tensor.nbytes,
-                storage.nbytes,
+                storage_nbytes,
             )
         return start, clamped_end
 
