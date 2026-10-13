@@ -104,7 +104,7 @@ class _HixlDeviceRegistration:
     underlying hcomm registry is process-global: a second engine that
     re-registers an allocator segment already registered by the first fails
     with PARAM_INVALID. Every EPLB model (target and drafter) must therefore
-    share one engine per device. The ledger records which segments are
+    share one engine per device. The ledger records which ranges are
     registered and which peers are connected, so a later communicator only
     adds the missing state; ``users`` refcounts the communicators and the
     last one tears the engine down.
@@ -113,7 +113,7 @@ class _HixlDeviceRegistration:
     def __init__(self, engine: Any, local_engine: str) -> None:
         self.engine = engine
         self.local_engine = local_engine
-        self.segments: dict[tuple[int, int], int] = {}
+        self.ranges: dict[tuple[int, int], int] = {}
         self.connected: set[str] = set()
         self.users = 0
 
@@ -339,54 +339,51 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
             return registration
 
     def _register_tensor_segments(self, tensors: Sequence[torch.Tensor]) -> None:
-        """Register the allocator segments holding the transferable tensors.
+        """Register the 2 MiB units holding the transferable tensors.
 
-        Per-tensor padded ranges fragment into one region per contiguous
-        tensor run and exceed the engine's region limit on deep MoE models,
-        so register whole segments instead: a segment is 2 MiB aligned, which
-        is exactly the granularity a registration accepts, and transfers only
-        ever touch expert slots named in the exchanged remote metadata.
+        Registering whole allocator segments is not safe: torch_npu's caching
+        allocator unmaps completely empty chunks of a live expandable segment
+        (``ExpandableSegment::unmap`` -> ``AclrtUnmapMem``), and the unmap
+        fails with 507899 while the range is still registered with the hccl
+        comm by HIXL. Register instead exactly the 2 MiB-aligned units that
+        hold live tensor bytes: every registered unit keeps its allocator
+        chunk non-empty for the tensor's lifetime, so the allocator never
+        unmaps it.
 
         Registration is deduplicated against the shared per-device ledger by
         range subtraction: the engine behind it has already registered every
-        segment held by an earlier communicator, the process-global hcomm
-        layer rejects overlaps (not just identical ranges), and a segment's
-        reported extent can grow between two snapshots.
+        range held by an earlier communicator, and the process-global hcomm
+        layer rejects overlaps (not just identical ranges).
         """
         registration = self._registration
         assert registration is not None
-        segments = sorted(
-            {
-                (int(segment["address"]), int(segment["total_size"]))
-                for segment in torch.npu.memory_snapshot()
-                if segment.get("device") == self._device.index
-            }
-        )
-        regions: set[tuple[int, int]] = set()
+        live_ranges = []
         for tensor in tensors:
-            segment = next(
+            start = tensor.data_ptr()
+            end = start + tensor.nbytes
+            live_ranges.append(
                 (
-                    (address, size)
-                    for address, size in segments
-                    if address <= tensor.data_ptr() and tensor.data_ptr() + tensor.nbytes <= address + size
-                ),
-                None,
+                    start - start % _HIXL_MEMORY_ALIGNMENT,
+                    ((end + _HIXL_MEMORY_ALIGNMENT - 1) // _HIXL_MEMORY_ALIGNMENT)
+                    * _HIXL_MEMORY_ALIGNMENT,
+                )
             )
-            if segment is None:
-                raise RuntimeError("HIXL EPLB could not resolve an allocator segment for every expert tensor")
-            if segment[0] % _HIXL_MEMORY_ALIGNMENT or segment[1] % _HIXL_MEMORY_ALIGNMENT:
-                raise RuntimeError("HIXL EPLB allocator segments must be 2 MiB aligned")
-            regions.add(segment)
-        ordered_regions = sorted(regions)
+        live_ranges.sort()
+        ordered_regions: list[tuple[int, int]] = []
+        for start, end in live_ranges:
+            if ordered_regions and start <= ordered_regions[-1][1]:
+                ordered_regions[-1] = (ordered_regions[-1][0], max(ordered_regions[-1][1], end))
+            else:
+                ordered_regions.append((start, end))
         with _HIXL_DEVICE_REGISTRATIONS_LOCK:
             new_regions = [
                 subregion
                 for start, size in ordered_regions
-                for subregion in _subtract_registered(start, size, sorted(registration.segments))
+                for subregion in _subtract_registered(start, size, sorted(registration.ranges))
             ]
-            if len(registration.segments) + len(new_regions) > _HIXL_MAX_REGISTERED_REGIONS:
+            if len(registration.ranges) + len(new_regions) > _HIXL_MAX_REGISTERED_REGIONS:
                 raise RuntimeError(
-                    f"HIXL EPLB requires {len(registration.segments) + len(new_regions)} memory "
+                    f"HIXL EPLB requires {len(registration.ranges) + len(new_regions)} memory "
                     f"registrations across its models; the HIXL limit is {_HIXL_MAX_REGISTERED_REGIONS}"
                 )
             if self._rank == 0:
@@ -396,11 +393,11 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
                     "(%d already registered).",
                     len(new_regions),
                     registered_bytes / 1024**3,
-                    len(registration.segments),
+                    len(registration.ranges),
                 )
             for start, size in new_regions:
                 logger.debug("HIXL EPLB registering region (%#x, %d)", start, size)
-                registration.segments[(start, size)] = self._register_region(start, size)
+                registration.ranges[(start, size)] = self._register_region(start, size)
 
     def _register_region(self, address: int, size: int) -> int:
         assert self._engine is not None
@@ -642,7 +639,7 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
                 registration.engine.disconnect(remote_engine)
             except Exception:
                 pass
-        for handle in reversed(list(registration.segments.values())):
+        for handle in reversed(list(registration.ranges.values())):
             try:  # noqa: SIM105
                 registration.engine.deregister_mem(handle)
             except Exception:

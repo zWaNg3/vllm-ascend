@@ -94,19 +94,10 @@ def test_hixl_reads_registered_remote_expert(monkeypatch):
     monkeypatch.setitem(sys.modules, "hixl", _fake_hixl(engine))
     monkeypatch.setattr(eplb_communicator, "is_weak_contiguous", lambda _tensor: True)
     set_device = MagicMock()
-    memory_snapshot = MagicMock(
-        return_value=[
-            {
-                "device": 0,
-                "address": 0,
-                "total_size": 8_388_608,
-            }
-        ]
-    )
     monkeypatch.setattr(
         torch,
         "npu",
-        SimpleNamespace(set_device=set_device, memory_snapshot=memory_snapshot),
+        SimpleNamespace(set_device=set_device),
         raising=False,
     )
     monkeypatch.setattr(eplb_communicator, "get_ip", lambda: "192.0.2.1")
@@ -167,7 +158,7 @@ def test_hixl_reads_registered_remote_expert(monkeypatch):
     assert engine.options == {}
     assert engine.connected == [("192.0.2.2:12346", 300_000)]
     assert len(engine.registered) == 1
-    assert (engine.registered[0].addr, engine.registered[0].len) == (0, 8_388_608)
+    assert (engine.registered[0].addr, engine.registered[0].len) == (0, 2_097_152)
     assert len(engine.transfers) == 1
     remote_engine, operation, descriptors = engine.transfers[0]
     assert remote_engine == "192.0.2.2:12346"
@@ -176,7 +167,6 @@ def test_hixl_reads_registered_remote_expert(monkeypatch):
         (5000, 13016, 16),
         (6100, 14200, 16),
     ]
-    assert memory_snapshot.call_count == 1
     assert work.wait.call_count == 2
     timing = communicator._eplb_hixl_phase_timings[0]
     assert (timing.request_count, timing.transfer_bytes) == (1, 32)
@@ -214,8 +204,8 @@ def test_hixl_destructor_cleans_up_when_modules_are_unavailable(monkeypatch):
     communicator._remote_engines = {1: "peer"}
     communicator._remote_send_meta = {1: {}}
     registration = eplb_communicator._HixlDeviceRegistration(engine, "192.0.2.1:12345")
-    registration.segments[(0, 1)] = 1
-    registration.segments[(2, 3)] = 2
+    registration.ranges[(0, 1)] = 1
+    registration.ranges[(2, 3)] = 2
     registration.connected.add("peer")
     registration.users = 1
     eplb_communicator._HIXL_DEVICE_REGISTRATIONS[0] = registration
