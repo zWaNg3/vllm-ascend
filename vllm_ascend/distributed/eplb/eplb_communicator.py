@@ -26,6 +26,7 @@ from vllm.utils.network_utils import get_ip, get_open_port, join_host_port
 
 _HIXL_MEMORY_ALIGNMENT = 2 * 1024 * 1024
 _HIXL_MAX_REGISTERED_REGIONS = 256
+_HIXL_ABSURD_NBYTES = 1 << 40
 _TRANSFER_TIMEOUT_SECONDS = 300
 _STATUS_POLL_SECONDS = 0.0005
 
@@ -376,7 +377,10 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
                 f"[{storage_data_ptr:#x}, {storage_end:#x})"
             )
         end = min(end, storage_end)
-        if block_end is not None:
+        if block_end is not None and end - start > _HIXL_ABSURD_NBYTES:
+            # Only clamp absurd ranges to the allocator block: the snapshot's
+            # block sizes under-report some sane tensors, so clamping those
+            # would truncate valid registrations.
             end = min(end, block_end)
         if end < start + tensor.nbytes and self._rank == 0 and start not in self._clamp_warned:
             self._clamp_warned.add(start)
@@ -454,7 +458,7 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
                 self._snapshot_block_end(snapshot, tensor.data_ptr()),
             )
             self._live_ends[start] = end
-            if self._rank == 0 and tensor_index < 25:
+            if self._rank == 0:
                 logger.info(
                     "HIXL EPLB expert tensor #%d: shape=%s dtype=%s nbytes=%d "
                     "data_ptr=%#x live_nbytes=%d",
@@ -476,8 +480,8 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
             if segment is None:
                 raise RuntimeError(
                     "HIXL EPLB could not resolve an allocator segment for expert tensor "
-                    f"(shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
-                    f"nbytes={tensor.nbytes}, data_ptr={start:#x})"
+                    f"#{tensor_index} (shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+                    f"nbytes={tensor.nbytes}, data_ptr={start:#x}, live_end={end:#x})"
                 )
             if segment[0] % _HIXL_MEMORY_ALIGNMENT or segment[1] % _HIXL_MEMORY_ALIGNMENT:
                 raise RuntimeError("HIXL EPLB allocator segments must be 2 MiB aligned")
