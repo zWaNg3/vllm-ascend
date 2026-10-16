@@ -10,7 +10,7 @@ paths that could not succeed anyway.
 
 import glob
 import os
-from collections.abc import AbstractSet, Callable
+from collections.abc import Callable, Set
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
@@ -478,7 +478,7 @@ def _collect_matching_weights(
     shards: list[str],
     normalize: Callable[[str], str],
     wanted: dict[str, dict[int, tuple[int, int]]],
-    wanted_suffixes: AbstractSet[str],
+    wanted_suffixes: Set[str],
     buckets: dict[tuple[int, int], dict[str, torch.Tensor]],
     matched: set[tuple[int, int]],
 ) -> None:
