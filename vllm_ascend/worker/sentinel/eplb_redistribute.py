@@ -10,7 +10,7 @@ paths that could not succeed anyway.
 
 import glob
 import os
-from collections.abc import Callable
+from collections.abc import AbstractSet, Callable
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
@@ -30,11 +30,8 @@ from vllm_ascend.ops.fused_moe.routed_experts import AscendUnquantizedFusedMoEMe
 from vllm_ascend.quantization.methods.w4a8.w4a8 import (
     AscendW4A8DynamicFusedMoEMethod,
 )
-from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import (
-    AscendW8A8DynamicFusedMoEMethod,
-    scale_from_float_to_int64,
-)
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, COMPRESSED_TENSORS_METHOD, maybe_trans_nz
+from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import AscendW8A8DynamicFusedMoEMethod
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, ASCEND_QUANTIZATION_METHOD, maybe_trans_nz
 
 __all__ = [
     "build_orig_to_dense_rank_table",
@@ -54,12 +51,13 @@ _W2_SCALE_SUFFIX = "down_proj.weight_scale"
 _W13_SCALE_BIAS_SUFFIXES = ("gate_up_proj.scale_bias", "gate_proj.scale_bias", "up_proj.scale_bias")
 _W2_SCALE_BIAS_SUFFIX = "down_proj.scale_bias"
 
-# Quant schemes the reload supports (gated in _reload_local_slots).
-_SUPPORTED_QUANT_TYPES = {
-    AscendUnquantizedFusedMoEMethod,
-    AscendW8A8DynamicFusedMoEMethod,
-    AscendW4A8DynamicFusedMoEMethod,
-}
+# Every checkpoint key the reload may consume, across all supported schemes.
+_WANTED_SUFFIXES = frozenset(
+    _W13_WEIGHT_SUFFIXES
+    + _W13_SCALE_SUFFIXES
+    + _W13_SCALE_BIAS_SUFFIXES
+    + (_W2_WEIGHT_SUFFIX, _W2_SCALE_SUFFIX, _W2_SCALE_BIAS_SUFFIX)
+)
 
 # (layer, expert) pairs per chunk: a larger chunk amortises the device rounds
 # further but grows the stack's transient device memory.
@@ -160,62 +158,88 @@ def _shard_col(t: torch.Tensor, tp_rank: int, tp_size: int) -> torch.Tensor:
     return t.narrow(1, tp_rank * shard, shard)
 
 
-def _gather_w13(
-    tensors: dict[str, torch.Tensor],
-    tp_rank: int,
-    tp_size: int,
-) -> torch.Tensor:
-    """Assemble one expert's w13 ([2I_local, H]) from checkpoint tensors."""
-    fused = tensors.get("gate_up_proj.weight")
-    if fused is not None:
-        half = fused.shape[0] // 2
-        gate, up = fused[:half], fused[half:]
-    else:
-        gate, up = tensors["gate_proj.weight"], tensors["up_proj.weight"]
-    return torch.cat([_shard_row(gate, tp_rank, tp_size), _shard_row(up, tp_rank, tp_size)], dim=0)
+# A recipe lands one runtime attribute: ``post(source(tensors, tp_rank, tp_size))``.
+# The two halves are independent axes -- where the numbers come from in the
+# checkpoint, and what the runtime wants done to them -- so a scheme picks one
+# of each instead of needing one function per (scheme, attribute) pair.
+_Source = Callable[[dict[str, torch.Tensor], int, int], torch.Tensor]
+_Post = Callable[[torch.Tensor], torch.Tensor]
+_Recipe = tuple[_Source, _Post]
 
 
-def _gather_w13_scale(
-    tensors: dict[str, torch.Tensor],
-    tp_rank: int,
-    tp_size: int,
-) -> torch.Tensor:
-    """1-D w13 scale ([2I_local]) from checkpoint tensors."""
-    fused = tensors.get("gate_up_proj.weight_scale")
-    if fused is not None:
-        half = fused.shape[0] // 2
-        gate, up = fused[:half], fused[half:]
-    else:
-        gate = tensors["gate_proj.weight_scale"]
-        up = tensors["up_proj.weight_scale"]
-    return torch.cat([_shard_row(gate, tp_rank, tp_size), _shard_row(up, tp_rank, tp_size)], dim=0).view(-1)
+# Sources: the checkpoint-side gather for one expert, sharded for this TP rank.
+def _gate_up(suffix: str) -> _Source:
+    """w13 order out of the checkpoint: fused ``gate_up_proj``, or split gate+up.
+
+    Either way each half is row-sharded and the two are concatenated
+    gate-first.
+    """
+
+    def source(tensors: dict[str, torch.Tensor], tp_rank: int, tp_size: int) -> torch.Tensor:
+        fused = tensors.get(f"gate_up_proj.{suffix}")
+        if fused is not None:
+            gate, up = fused.chunk(2)
+        else:
+            gate, up = tensors[f"gate_proj.{suffix}"], tensors[f"up_proj.{suffix}"]
+        return torch.cat([_shard_row(gate, tp_rank, tp_size), _shard_row(up, tp_rank, tp_size)], dim=0)
+
+    return source
 
 
-def _gather_w13_scale_bias(
-    tensors: dict[str, torch.Tensor],
-    tp_rank: int,
-    tp_size: int,
-) -> torch.Tensor:
-    """2-D model-slim w13 scale_bias ([2I, 1]) from checkpoint tensors."""
-    fused = tensors.get("gate_up_proj.scale_bias")
-    if fused is not None:
-        half = fused.shape[0] // 2
-        gate, up = fused[:half], fused[half:]
-    else:
-        gate = tensors["gate_proj.scale_bias"]
-        up = tensors["up_proj.scale_bias"]
-    return torch.cat([_shard_row(gate, tp_rank, tp_size), _shard_row(up, tp_rank, tp_size)], dim=0)
+def _down_proj(suffix: str, *, shard: bool = False) -> _Source:
+    """``down_proj.<suffix>`` as this rank holds it.
+
+    Only the weight's input dim is split by TP; the scale is per output channel
+    and scale_bias is grouped per rank already, so both are taken whole.
+    """
+
+    def source(tensors: dict[str, torch.Tensor], tp_rank: int, tp_size: int) -> torch.Tensor:
+        tensor = tensors[f"down_proj.{suffix}"]
+        return _shard_col(tensor, tp_rank, tp_size) if shard else tensor
+
+    return source
+
+
+def _slot_tensor(layer: torch.nn.Module, attr: str, slot: int) -> torch.Tensor:
+    """The runtime storage of one per-slot tensor.
+
+    EPLB layouts keep a per-slot ``<attr>_list``, the whole-tensor layout slices
+    dim 0 of ``<attr>``. The two are mutually exclusive -- a scheme ``delattr``s
+    the base name as it builds the list -- so this is unambiguous.
+    """
+    per_slot = getattr(layer, f"{attr}_list", None)
+    return per_slot[slot] if per_slot is not None else getattr(layer, attr).data[slot]
+
+
+# Posts: the gathered checkpoint tensor -> the shape/dtype the runtime slot holds.
+def _runtime_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Checkpoint ``[out, in]`` -> the runtime's ``[in, out]``."""
+    return weight.transpose(0, 1).contiguous()
+
+
+def _flatten(t: torch.Tensor) -> torch.Tensor:
+    """1-D view: the shape the runtime holds these scales in."""
+    return t.view(-1)
 
 
 def _reinterpret_fp32_to_int64(t: torch.Tensor) -> torch.Tensor:
     """Bit-preserving fp32 -> int64 cast (raw scale bits stored as int64).
 
     Mirrors ``AscendW4A8DynamicFusedMoEMethod._process_scale``'s
-    reinterpretation; no transpose here (the caller supplies the flattened
-    scale)."""
+    reinterpretation; the shape is preserved, so the caller reshapes."""
     arr = t.cpu().numpy()
     arr.dtype = np.uint32
     return torch.from_numpy(arr.astype(np.int64))
+
+
+def _bits(scale: torch.Tensor) -> torch.Tensor:
+    """Flat int64 bit pattern of an fp32 scale (see ``_reinterpret_fp32_to_int64``)."""
+    return _reinterpret_fp32_to_int64(scale.to(torch.float32).view(-1))
+
+
+def _bits_2d(scale: torch.Tensor) -> torch.Tensor:
+    """As ``_bits``, but ``[1, H]``: npu_grouped_matmul takes the w2 scale 2-D."""
+    return _reinterpret_fp32_to_int64(scale.to(torch.float32).view(1, -1))
 
 
 def _w4a8_scale_bias_modelslim(w2_scale_bias: torch.Tensor) -> torch.Tensor:
@@ -223,67 +247,99 @@ def _w4a8_scale_bias_modelslim(w2_scale_bias: torch.Tensor) -> torch.Tensor:
     return w2_scale_bias.transpose(0, 1).contiguous().sum(0)
 
 
+def _build(recipe: _Recipe, tensors: dict[str, torch.Tensor], tp_rank: int, tp_size: int) -> torch.Tensor:
+    """Evaluate one recipe against one expert's checkpoint tensors."""
+    source, post = recipe
+    return post(source(tensors, tp_rank, tp_size))
+
+
+# A scheme is (quant method class, checkpoint sub-format); the sub-format is
+# None for schemes that have only one.
+_Scheme = tuple[type, str | None]
+
+# The two weight tensors every scheme reloads. Their runtime attributes are the
+# ones that take the layout cast.
+_WEIGHT_RECIPES: dict[str, _Recipe] = {
+    "w13_weight": (_gate_up("weight"), _runtime_weight),
+    "w2_weight": (_down_proj("weight", shard=True), _runtime_weight),
+}
+_WEIGHT_ATTRS = tuple(_WEIGHT_RECIPES)
+
+# What each scheme reloads: runtime attribute -> recipe. The attributes are the
+# runtime storage names, which is what lets assembly, H2D, layout cast and
+# scatter all be driven off this one table: adding a tensor to a scheme means
+# one entry here and nothing else. Each recipe mirrors the matching
+# ``process_weights_after_loading`` transform (TP sharding is a no-op under EP,
+# which scale_down requires).
+_SCHEME_RECIPES: dict[_Scheme, dict[str, _Recipe]] = {
+    (AscendUnquantizedFusedMoEMethod, None): _WEIGHT_RECIPES,
+    (AscendW8A8DynamicFusedMoEMethod, None): _WEIGHT_RECIPES
+    | {
+        "w13_weight_scale_fp32": (_gate_up("weight_scale"), _flatten),
+        "w2_weight_scale": (_down_proj("weight_scale"), _flatten),
+    },
+    (AscendW4A8DynamicFusedMoEMethod, ASCEND_QUANTIZATION_METHOD): _WEIGHT_RECIPES
+    | {
+        "w13_weight_scale": (_gate_up("weight_scale"), _bits),
+        "w2_weight_scale": (_down_proj("weight_scale"), _bits_2d),
+        "w13_scale_bias": (_gate_up("scale_bias"), _flatten),
+        "w2_scale_bias": (_down_proj("scale_bias"), _w4a8_scale_bias_modelslim),
+    },
+}
+
+
+def _to_fractal_nz(weight: torch.Tensor) -> torch.Tensor:
+    """Unconditional FRACTAL_NZ cast, as W8A8's weights are loaded with."""
+    return torch_npu.npu_format_cast(weight, ACL_FORMAT_FRACTAL_NZ)
+
+
+# Weight layout cast per quant method class. Not unifiable: W8A8's
+# ``npu_grouped_matmul_swiglu_quant`` only takes NZ weights, whereas
+# ``maybe_trans_nz`` is a no-op unless the hardware policy forces NZ.
+_WEIGHT_LAYOUT_CAST: dict[type, Callable[[torch.Tensor], torch.Tensor]] = {
+    AscendUnquantizedFusedMoEMethod: maybe_trans_nz,
+    AscendW8A8DynamicFusedMoEMethod: _to_fractal_nz,
+    AscendW4A8DynamicFusedMoEMethod: maybe_trans_nz,
+}
+
+
+def _resolve_scheme(routed: torch.nn.Module) -> tuple[_Scheme, dict[str, _Recipe]]:
+    """The (scheme, recipes) pair a routed-experts layer reloads through.
+
+    A combination missing from ``_SCHEME_RECIPES`` raises instead of falling
+    back -- notably compressed-tensors W4A8, whose checkpoint stores one int4
+    per int8 and derives scale_bias rather than shipping it.
+    """
+    # Quantized layers wrap the scheme in AscendFusedMoEMethod; the scheme class
+    # lives in its .quant_method attribute.
+    method = getattr(routed.quant_method, "quant_method", routed.quant_method)
+    sub_format = method.quant_method if type(method) is AscendW4A8DynamicFusedMoEMethod else None
+    scheme = (type(method), sub_format)
+    recipes = _SCHEME_RECIPES.get(scheme)
+    if recipes is None:
+        detail = f" sub-format '{sub_format}'" if sub_format else ""
+        raise NotImplementedError(
+            f"[FT] scale_down weight reload is not implemented for quant method {type(method).__name__}{detail}."
+        )
+    return scheme, recipes
+
+
 def _assemble_expert(
     pair: tuple[int, int],
     routed_layers: list,
     buckets: dict[tuple[int, int], dict[str, torch.Tensor]],
-    quant_type: type,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor | None,
-    torch.Tensor | None,
-    torch.Tensor | None,
-    torch.Tensor | None,
-]:
-    """CPU assembly of one expert's (w13, w2, w13_scale, w2_scale,
-    w13_scale_bias, w2_scale_bias); thread-safe (read-only shared state).
+    recipes: dict[str, _Recipe],
+) -> dict[str, torch.Tensor]:
+    """CPU assembly of one expert's tensors, keyed by runtime attribute.
 
-    Scales/scale_bias are None for the unquantized scheme; the w2 scale is a
-    view into its bucket (callers must not write it). Mirrors the relevant
-    ``process_weights_after_loading`` per-expert transforms (TP sharding is a
-    no-op under EP, which scale_down requires).
+    Thread-safe (reads only shared state). The keys come from
+    ``_SCHEME_RECIPES``, so they are exactly the per-slot attributes the chunk
+    engine has to write back.
     """
-    layer_idx, logical_id = pair
-    routed = routed_layers[layer_idx]
-    w8a8 = quant_type is AscendW8A8DynamicFusedMoEMethod
-    w4a8 = quant_type is AscendW4A8DynamicFusedMoEMethod
-    if getattr(routed, "w13_bias", None) is not None or getattr(routed, "w2_bias", None) is not None:
-        raise NotImplementedError("[FT] scale_down weight reload does not support MoE expert bias yet.")
+    routed = routed_layers[pair[0]]
     tp_rank, tp_size = _tp_shard_info(routed)
-    tensors = buckets[(layer_idx, logical_id)]
-
-    w13 = _gather_w13(tensors, tp_rank, tp_size).transpose(0, 1).contiguous()
-    w2 = _shard_col(tensors[_W2_WEIGHT_SUFFIX], tp_rank, tp_size).transpose(0, 1).contiguous()
-
-    if not w8a8 and not w4a8:
-        return w13, w2, None, None, None, None
-
-    w13_scale_src = _gather_w13_scale(tensors, tp_rank, tp_size)
-    w2_scale_src = tensors[_W2_SCALE_SUFFIX]
-
-    if w8a8:
-        return w13, w2, w13_scale_src, w2_scale_src.view(-1), None, None
-
-    # W4A8: the scheme instance carries the sub-format ("ascend" modelslim vs
-    # "compressed-tensors"); both converge to identical runtime shapes below.
-    method = getattr(routed.quant_method, "quant_method", routed.quant_method)
-    modelslim = method.quant_method != COMPRESSED_TENSORS_METHOD
-
-    # Scales: bit-reinterpret fp32 -> int64 (w13 already flattened to [2I];
-    # w2 kept as [1, H] for npu_grouped_matmul).
-    w13_scale = _reinterpret_fp32_to_int64(w13_scale_src.to(torch.float32))
-    w2_scale = _reinterpret_fp32_to_int64(w2_scale_src.to(torch.float32).view(1, -1))
-
-    if not modelslim:
-        raise NotImplementedError("[FT] scale_down W4A8 weight reload does not supportCOMPRESSED_TENSORS foemat yet.")
-    # weights already packed; scale_bias read from checkpoint. w13 is
-    # already 1-D([2I]); w2's checkpoint [out, 16//tp] is reduced over the
-    # replica/group dim down to [out]
-    w13_scale_bias = _gather_w13_scale_bias(tensors, tp_rank, tp_size).view(-1)
-    w2_scale_bias = _w4a8_scale_bias_modelslim(tensors[_W2_SCALE_BIAS_SUFFIX])
-
-    return w13, w2, w13_scale, w2_scale, w13_scale_bias, w2_scale_bias
+    tensors = buckets[pair]
+    return {attr: _build(recipe, tensors, tp_rank, tp_size) for attr, recipe in recipes.items()}
 
 
 def _reload_local_slots(
@@ -291,158 +347,82 @@ def _reload_local_slots(
     local_slots: dict[tuple[int, int], int],
     buckets: dict[tuple[int, int], dict[str, torch.Tensor]],
 ) -> int:
-    """Reload all local (layer, expert) pairs in quant-uniform chunks.
+    """Reload all local (layer, expert) pairs in scheme-uniform chunks.
 
-    Entries are grouped by (quant scheme, sub-format, weight shapes, dtypes,
-    storage layout) so each stacked chunk is shape-uniform, e.g. DeepSeek-V4
-    43-layers, 8 experts to reload, 344 pairs become ceil(344 / 32) = 11 chunks
-    instead of 344 per-expert reloads. modelslim vs compressed_tensors produce
-    different per-slot layouts and scale_bias sources, so W4A8 is split by
-    sub-format to keep each chunk shape-uniform.
+    Entries are grouped by (scheme, per-slot layout) so each stacked chunk is
+    shape- and dtype-uniform, e.g. DeepSeek-V4 43-layers, 8 experts to reload,
+    344 pairs become ceil(344 / 32) = 11 chunks instead of 344 per-expert
+    reloads. The layout is read off the runtime slots the scheme declares, so a
+    new scheme -- or one extra tensor on an existing one -- needs no change
+    here and cannot share a chunk with an incompatible layout.
     """
     groups: dict[tuple, list[tuple[int, int]]] = {}
     for (layer_idx, logical_id), slot in sorted(local_slots.items()):
         routed = routed_layers[layer_idx]
-        # Quantized layers wrap the scheme in AscendFusedMoEMethod; the
-        # scheme class lives in its .quant_method attribute.
-        quant_method = getattr(routed.quant_method, "quant_method", routed.quant_method)
-        if type(quant_method) not in _SUPPORTED_QUANT_TYPES:
-            raise NotImplementedError(
-                f"[FT] scale_down weight reload is not implemented for quant method {type(quant_method).__name__}."
-            )
-        w13_weight_list = getattr(routed, "w13_weight_list", None)
-        if w13_weight_list is not None:
-            w13_shape, w13_dtype = w13_weight_list[slot].shape, w13_weight_list[slot].dtype
-            w2_shape, w2_dtype = routed.w2_weight_list[slot].shape, routed.w2_weight_list[slot].dtype
-        else:
-            w13_shape, w13_dtype = routed.w13_weight.shape[1:], routed.w13_weight.dtype
-            w2_shape, w2_dtype = routed.w2_weight.shape[1:], routed.w2_weight.dtype
-        sub_format = quant_method.quant_method if type(quant_method) is AscendW4A8DynamicFusedMoEMethod else None
-        key = (type(quant_method), sub_format, w13_shape, w13_dtype, w2_shape, w2_dtype, w13_weight_list is not None)
-        groups.setdefault(key, []).append((layer_idx, logical_id))
+        if getattr(routed, "w13_bias", None) is not None or getattr(routed, "w2_bias", None) is not None:
+            raise NotImplementedError("[FT] scale_down weight reload does not support MoE expert bias yet.")
+        scheme, recipes = _resolve_scheme(routed)
+        layout = []
+        for attr in recipes:
+            tensor = _slot_tensor(routed, attr, slot)
+            layout.append((attr, tensor.shape, tensor.dtype))
+        groups.setdefault((scheme, tuple(layout)), []).append((layer_idx, logical_id))
 
     reloaded = 0
-    for key, pairs in groups.items():
-        quant_type = key[0]
+    for (scheme, _layout), pairs in groups.items():
+        quant_type = scheme[0]
+        recipes = _SCHEME_RECIPES[scheme]
         for start in range(0, len(pairs), _RELOAD_CHUNK_SIZE):
             chunk = pairs[start : start + _RELOAD_CHUNK_SIZE]
-            reloaded += _reload_chunk(quant_type, routed_layers, chunk, local_slots, buckets)
+            reloaded += _reload_chunk(quant_type, recipes, routed_layers, chunk, local_slots, buckets)
     return reloaded
 
 
 def _reload_chunk(
     quant_type: type,
+    recipes: dict[str, _Recipe],
     routed_layers: list,
     pairs: list[tuple[int, int]],
     local_slots: dict[tuple[int, int], int],
     buckets: dict[tuple[int, int], dict[str, torch.Tensor]],
 ) -> int:
-    """Apply one chunk of pairs sharing a quant scheme and layout.
+    """Apply one chunk of pairs sharing a scheme and per-slot layout.
 
-    Assemble the chunk's (w13, w2, scales, scale_bias) pairs on the CPU in
-    parallel, stack them, then pay one H2D + one format cast for the whole
-    stack and scatter it with one non-blocking copy per slot, drained by a
-    single sync. Shapes must match (see ``_reload_local_slots``); stacking and
-    the device-side cast assume it.
+    Assemble the chunk on the CPU in parallel, then pay one H2D and one layout
+    cast per tensor for the whole stack, and scatter it with one non-blocking
+    copy per slot, drained by a single sync. Per pair that replaces a CPU
+    transpose-copy plus its own H2D, cast and scatter.
+
+    Everything below the assembly is driven by the recipes the scheme declares,
+    so a scheme only decides how each attribute is produced: stacking,
+    transfer, layout cast and scatter are identical for all of them. Shapes and
+    dtypes must match across the chunk (see ``_reload_local_slots``).
     """
-    w13s: list[torch.Tensor] = []
-    w2s: list[torch.Tensor] = []
-    w13_scales: list[torch.Tensor] = []
-    w2_scales: list[torch.Tensor] = []
-    w13_scale_biases: list[torch.Tensor] = []
-    w2_scale_biases: list[torch.Tensor] = []
-    w8a8 = quant_type is AscendW8A8DynamicFusedMoEMethod
-    w4a8 = quant_type is AscendW4A8DynamicFusedMoEMethod
-    has_scales = w8a8 or w4a8
-
     # CPU phase: assemble pairs in parallel (read-only shared state).
-    assemble = partial(_assemble_expert, routed_layers=routed_layers, buckets=buckets, quant_type=quant_type)
+    assemble = partial(_assemble_expert, routed_layers=routed_layers, buckets=buckets, recipes=recipes)
     with ThreadPoolExecutor(max_workers=min(len(pairs), _GATHER_MAX_WORKERS)) as pool:
-        for w13, w2, w13_scale, w2_scale, w13_scale_bias, w2_scale_bias in pool.map(assemble, pairs):
-            w13s.append(w13)
-            w2s.append(w2)
-            if has_scales:
-                w13_scales.append(w13_scale)
-                w2_scales.append(w2_scale)
-            if w4a8:
-                w13_scale_biases.append(w13_scale_bias)
-                w2_scale_biases.append(w2_scale_bias)
+        per_expert = list(pool.map(assemble, pairs))
+    attrs = list(recipes)
 
-    w13_batch = torch.stack(w13s)
-    w2_batch = torch.stack(w2s)
-    if has_scales:
-        w13_scale_batch = torch.stack(w13_scales)
-        w2_scale_batch = torch.stack(w2_scales)
-    if w4a8:
-        w13_scale_bias_batch = torch.stack(w13_scale_biases)
-        w2_scale_bias_batch = torch.stack(w2_scale_biases)
-
-    # Device phase: one H2D + one format cast per weight class.
+    # Device phase: one H2D and one layout cast per attribute, for the whole
+    # stack. Landing at the dtype the runtime slot already holds covers every
+    # scheme: int8 weights, the fp32 W8A8 w13 scale, and W4A8's int64
+    # bit-reinterpreted scales with its fp32 scale_bias.
     first_layer = routed_layers[pairs[0][0]]
     first_slot = local_slots[pairs[0]]
-    w13_weight_list = getattr(first_layer, "w13_weight_list", None)
-    if w13_weight_list is not None:
-        device = w13_weight_list[first_slot].device
-        w13_dtype, w2_dtype = w13_weight_list[first_slot].dtype, first_layer.w2_weight_list[first_slot].dtype
-    else:
-        device = first_layer.w13_weight.device
-        w13_dtype, w2_dtype = first_layer.w13_weight.dtype, first_layer.w2_weight.dtype
-
-    if w8a8:
-        w13_batch = w13_batch.to(device=device)
-        w2_batch = w2_batch.to(device=device)
-        w13_scale_batch = w13_scale_batch.to(device=device, dtype=torch.float32)
-        w2_scale_batch = w2_scale_batch.to(device=device)
-    elif w4a8:
-        # Weights int8, scales int64 (bit-reinterpreted), scale_bias fp32.
-        w13_batch = w13_batch.to(device=device)
-        w2_batch = w2_batch.to(device=device)
-        w13_scale_batch = w13_scale_batch.to(device=device)
-        w2_scale_batch = w2_scale_batch.to(device=device)
-        w13_scale_bias_batch = w13_scale_bias_batch.to(device=device, dtype=torch.float32)
-        w2_scale_bias_batch = w2_scale_bias_batch.to(device=device, dtype=torch.float32)
-    else:
-        # Whole-tensor layout policy; no-op when it does not force NZ.
-        w13_batch = w13_batch.to(device=device, dtype=w13_dtype)
-        w2_batch = w2_batch.to(device=device, dtype=w2_dtype)
-    if w8a8:
-        w13_batch = torch_npu.npu_format_cast(w13_batch, ACL_FORMAT_FRACTAL_NZ)
-        w2_batch = torch_npu.npu_format_cast(w2_batch, ACL_FORMAT_FRACTAL_NZ)
-    else:
-        # W4A8 process_weights_after_loading also uses maybe_trans_nz.
-        w13_batch = maybe_trans_nz(w13_batch)
-        w2_batch = maybe_trans_nz(w2_batch)
+    landed: dict[str, torch.Tensor] = {}
+    for attr in attrs:
+        ref = _slot_tensor(first_layer, attr, first_slot)
+        stacked = torch.stack([expert[attr] for expert in per_expert])
+        landed[attr] = stacked.to(device=ref.device, dtype=ref.dtype)
+    for attr in _WEIGHT_ATTRS:
+        landed[attr] = _WEIGHT_LAYOUT_CAST[quant_type](landed[attr])
 
     # Scatter phase: non-blocking copies drained by one sync.
-    for i, (layer_idx, logical_id) in enumerate(pairs):
-        slot = local_slots[(layer_idx, logical_id)]
-        routed = routed_layers[layer_idx]
-        w13_weight_list = getattr(routed, "w13_weight_list", None)
-        if w13_weight_list is not None:
-            w13_weight_list[slot].copy_(w13_batch[i], non_blocking=True)
-            routed.w2_weight_list[slot].copy_(w2_batch[i], non_blocking=True)
-        else:
-            # Whole-tensor layout: the slot slice is one expert matrix.
-            routed.w13_weight.data[slot].copy_(w13_batch[i], non_blocking=True)
-            routed.w2_weight.data[slot].copy_(w2_batch[i], non_blocking=True)
-        if w8a8:
-            routed.w13_weight_scale_fp32_list[slot].copy_(w13_scale_batch[i], non_blocking=True)
-            w2_scale_target = routed.w2_weight_scale_list[slot]
-            routed.w2_weight_scale_list[slot].copy_(w2_scale_batch[i].to(w2_scale_target.dtype), non_blocking=True)
-            # Optional fused scales (enable_fused_mc2, currently rejected
-            # for scale_down).
-            fused_w1_scale_list = getattr(routed, "fused_w1_scale_list", None)
-            fused_w2_scale_list = getattr(routed, "fused_w2_scale_list", None)
-            if fused_w1_scale_list is not None and fused_w2_scale_list is not None:
-                fused_w1_scale_list[slot].copy_(scale_from_float_to_int64(w13_scales[i]))
-                fused_w2_scale_list[slot].copy_(scale_from_float_to_int64(w2_scales[i]))
-        if w4a8:
-            # Scales are already int64 (bit-reinterpreted) and scale_bias fp32,
-            # so a direct dtype-preserving copy into the int64/fp32 slot storage.
-            routed.w13_weight_scale_list[slot].copy_(w13_scale_batch[i], non_blocking=True)
-            routed.w2_weight_scale_list[slot].copy_(w2_scale_batch[i], non_blocking=True)
-            routed.w13_scale_bias_list[slot].copy_(w13_scale_bias_batch[i], non_blocking=True)
-            routed.w2_scale_bias_list[slot].copy_(w2_scale_bias_batch[i], non_blocking=True)
+    for i, pair in enumerate(pairs):
+        layer, slot = routed_layers[pair[0]], local_slots[pair]
+        for attr in attrs:
+            _slot_tensor(layer, attr, slot).copy_(landed[attr][i], non_blocking=True)
     torch.npu.synchronize()
     return len(pairs)
 
@@ -498,7 +478,7 @@ def _collect_matching_weights(
     shards: list[str],
     normalize: Callable[[str], str],
     wanted: dict[str, dict[int, tuple[int, int]]],
-    wanted_suffixes: set[str],
+    wanted_suffixes: AbstractSet[str],
     buckets: dict[tuple[int, int], dict[str, torch.Tensor]],
     matched: set[tuple[int, int]],
 ) -> None:
@@ -566,15 +546,6 @@ def reload_experts_from_disk(
     for layer_idx, logical_id in local_slots:
         wanted.setdefault(routed_layers[layer_idx].layer_name, {})[logical_id] = (layer_idx, logical_id)
 
-    wanted_suffixes = set(_W13_WEIGHT_SUFFIXES + _W13_SCALE_SUFFIXES)
-    wanted_suffixes.add(_W2_WEIGHT_SUFFIX)
-    wanted_suffixes.add(_W2_SCALE_SUFFIX)
-    # modelslim W4A8 keeps scale_bias in the checkpoint; compressed_tensors
-    # has no such keys (it derives scale_bias from weight*scale), so these
-    # suffixes are simply never matched for CT.
-    wanted_suffixes.update(_W13_SCALE_BIAS_SUFFIXES)
-    wanted_suffixes.add(_W2_SCALE_BIAS_SUFFIX)
-
     buckets: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
     matched: set[tuple[int, int]] = set()
 
@@ -585,9 +556,9 @@ def reload_experts_from_disk(
             "[FT] scale_down expert reload requires a safetensors checkpoint; "
             f"{vllm_config.model_config.model} has none."
         )
-    _collect_matching_weights(shards, normalize, wanted, wanted_suffixes, buckets, matched)
-    # Same reasoning: a pair with no checkpoint weight would leave its slot
-    # holding the previous occupant's weights.
+    _collect_matching_weights(shards, normalize, wanted, _WANTED_SUFFIXES, buckets, matched)
+    # A pair with no checkpoint weight would silently keep the previous
+    # occupant's weights in its slot, so fail instead.
     unmatched = [pair for pair in local_slots if pair not in matched]
     if unmatched:
         raise RuntimeError(
