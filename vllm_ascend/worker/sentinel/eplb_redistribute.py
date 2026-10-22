@@ -269,8 +269,8 @@ def _collect_matching_weights(
     never reach ``get_tensor``: reads stay limited to the wanted experts.
 
     ``suffix_map`` renames a checkpoint suffix into the bucket name the
-    reloaders consume (drafters use ``w1/w3/w2``); unmapped suffixes are
-    skipped. ``None`` matches suffixes verbatim.
+    reloaders consume (drafters use ``w1/w3/w2``); suffixes the map does not
+    know pass through unchanged. ``None`` matches suffixes verbatim.
     """
     for st_file in shards:
         with safe_open(st_file, framework="pt") as f:
@@ -281,9 +281,13 @@ def _collect_matching_weights(
                 key, suffix = found
                 matched.add(key)
                 if suffix_map is not None:
-                    suffix = suffix_map.get(suffix)
-                    if suffix is None:
-                        continue
+                    # A drafter can reach this point with raw checkpoint
+                    # suffixes ("w1.weight", no declared hf_to_vllm_mapper)
+                    # or already-mapped ones ("gate_proj.weight", normalize
+                    # ran the shared target mapper). Translate only the
+                    # former; discarding the latter would empty the bucket
+                    # for a matched expert.
+                    suffix = suffix_map.get(suffix, suffix)
                 if suffix in wanted_suffixes:
                     expert_weights.setdefault(key, {})[suffix] = f.get_tensor(raw_name)
 
