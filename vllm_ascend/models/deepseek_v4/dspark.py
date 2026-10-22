@@ -148,14 +148,18 @@ class DeepseekV4DSparkModel(nn.Module):
         # ModelSlim chooses the quantization method according to the linear prefix.
         # context_wkv_proj is a synthetic runtime module and does not exist in the
         # checkpoint quantization description, so reuse the first DSpark WKV prefix
-        # when selecting its quantization scheme.
+        # when selecting its quantization scheme. The description is keyed by the
+        # mapped module namespace ("model.mtp.N..."), same as every other drafter
+        # layer — a bare "mtp.0..." prefix misses it and silently builds an
+        # unquantized linear, leaving the checkpoint's weight_offset nowhere to
+        # load.
         self.context_wkv_proj = MergedColumnParallelLinear(
             config.hidden_size,
             [config.head_dim] * self.num_dspark_layers,
             bias=False,
             return_bias=False,
             quant_config=vllm_config.quant_config,
-            prefix="mtp.0.self_attn.wkv",
+            prefix=maybe_prefix(prefix, "mtp.0.self_attn.wkv"),
             disable_tp=True,
         )
 
