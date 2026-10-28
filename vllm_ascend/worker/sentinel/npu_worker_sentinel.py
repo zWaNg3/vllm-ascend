@@ -186,11 +186,8 @@ class WorkerSentinel(GPUWorkerSentinel):
         top of that, refreshes the Ascend kernel-facing routing tables into
         the densified id space and shrinks the MC2 physical-expert width.
 
-        Each EPLB-registered model is redistributed against its own placement:
-        ``redistribute_expert_placement`` reports the pairs needing a reload
-        *relative to the placement it is given*, so no model may borrow another's
-        result. They start out equal, but async EPLB rebalances each model state
-        independently.
+        Each EPLB-registered model (main model and drafter) is redistributed
+        against its own placement; results are never shared across models.
         """
         model_runner = self.worker.model_runner
 
@@ -228,13 +225,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         reassignments: set[tuple[int, int]],
         suffix_map: dict[str, str] | None = None,
     ) -> None:
-        """Make a model's already-redistributed placement live.
-
-        Reads the placement from ``model_state``, so it is always that model's
-        own. Every update is in place, so captured graphs stay valid. The
-        per-layer ``AscendEplbLayerState`` tensors are views of the committed
-        maps, so one commit reaches all of that model's layers.
-        """
+        """Commit a model's redistributed placement in place so captured graphs stay valid."""
         p2l = model_state.physical_to_logical_map
         num_local_experts = p2l.shape[1] // get_ep_group().world_size
 
@@ -248,9 +239,8 @@ class WorkerSentinel(GPUWorkerSentinel):
     def _registered_drafter(self, model_runner) -> tuple[torch.nn.Module, EplbModelState] | None:
         """Return the speculative drafter and its EPLB state, if EPLB has one."""
         draft_model = getattr(getattr(model_runner, "speculator", None), "model", None)
-        # The predicate maybe_register_speculator itself gates on: EPLB registers
-        # a MoE drafter only. Keying off moe_layers would admit DeepSeekV4MTP,
-        # which never reports num_moe_layers and so was never registered.
+        # EPLB registers a MoE drafter only (same gate as
+        # maybe_register_speculator); keying off moe_layers would over-admit.
         draft_moe = get_mixture_of_experts_model(draft_model)
         if draft_moe is None:
             return None

@@ -240,16 +240,14 @@ class DeepSeekMultiTokenPredictor(nn.Module):
 
 @support_torch_compile
 class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
-    # The draft lives in the target's checkpoint, so it shares the target's
-    # mapper; see ``DSparkDeepseekV4ForCausalLM.hf_to_vllm_mapper``.
+    # Shares the target's mapper; see DSparkDeepseekV4ForCausalLM.
     hf_to_vllm_mapper = AscendDeepseekV4ForCausalLM.hf_to_vllm_mapper
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
-        # Keep the parent prefix: the mapper rewrites the checkpoint's "mtp.N"
-        # keys to "model.mtp.N", which is what the quant description holds.
+        # Keep the parent prefix: the quant description uses "model.mtp.N" keys.
         self.model = DeepSeekMultiTokenPredictor(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model.mtp"))
         # Set MoE hyperparameters
         self.set_moe_parameters()

@@ -39,11 +39,8 @@ __all__ = [
     "reload_experts_from_disk",
 ]
 
-# Speculative drafters (MTP/DSpark) hold the same projection tensors as the
-# main model but their checkpoints name them w1/w3 (gate/up) and w2 (down).
-# Translate those onto the bucket names the reloaders consume, so a drafter
-# reload reuses the whole main-model path unchanged: pass this as
-# ``suffix_map`` to ``reload_experts_from_disk``.
+# Drafter checkpoints (MTP/DSpark) name projections w1/w3 (gate/up) and w2
+# (down); pass this as ``suffix_map`` to ``reload_experts_from_disk``.
 DRAFTER_SUFFIX_MAP = {
     "w1.weight": "gate_proj.weight",
     "w3.weight": "up_proj.weight",
@@ -268,9 +265,8 @@ def _collect_matching_weights(
     ``safe_open(...).keys()`` reads just the JSON header, so rejected names
     never reach ``get_tensor``: reads stay limited to the wanted experts.
 
-    ``suffix_map`` renames a checkpoint suffix into the bucket name the
-    reloaders consume (drafters use ``w1/w3/w2``); suffixes the map does not
-    know pass through unchanged. ``None`` matches suffixes verbatim.
+    ``suffix_map`` renames checkpoint suffixes into the reloaders' bucket
+    names (drafters use ``w1/w3/w2``); unknown suffixes pass through.
     """
     for st_file in shards:
         with safe_open(st_file, framework="pt") as f:
@@ -281,12 +277,9 @@ def _collect_matching_weights(
                 key, suffix = found
                 matched.add(key)
                 if suffix_map is not None:
-                    # A drafter can reach this point with raw checkpoint
-                    # suffixes ("w1.weight", no declared hf_to_vllm_mapper)
-                    # or already-mapped ones ("gate_proj.weight", normalize
-                    # ran the shared target mapper). Translate only the
-                    # former; discarding the latter would empty the bucket
-                    # for a matched expert.
+                    # The suffix may be raw ("w1.weight") or already mapped
+                    # by the shared hf_to_vllm_mapper; translate only the
+                    # former, so both namings bucket correctly.
                     suffix = suffix_map.get(suffix, suffix)
                 if suffix in wanted_suffixes:
                     expert_weights.setdefault(key, {})[suffix] = f.get_tensor(raw_name)
@@ -306,12 +299,9 @@ def reload_experts_from_disk(
     the slot from ``eplb_state.logical_to_physical_map``; the call must follow
     ``rebuild_model_expert_maps``.
 
-    ``suffix_map`` renames the checkpoint's projection suffixes onto the bucket
-    names above, for models whose checkpoint names them differently --
-    speculative drafters (MTP/DSpark) use ``w1/w3/w2``, so pass
-    ``DRAFTER_SUFFIX_MAP``. It is the only per-model difference: the layer
-    names, placement maps, shard selection and name mapper all come from
-    ``model``, so a drafter reload shares this path whole.
+    ``suffix_map`` renames checkpoint projection suffixes onto the reloaders'
+    bucket names; pass ``DRAFTER_SUFFIX_MAP`` for drafter reloads. All other
+    inputs (layer names, placement maps, shards, name mapper) come from ``model``.
     """
     if not reassignments:
         return 0
