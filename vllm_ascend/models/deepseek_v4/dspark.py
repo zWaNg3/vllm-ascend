@@ -150,6 +150,8 @@ class DeepseekV4DSparkModel(nn.Module):
 
         first_layer = self.layers[str(self.mtp_start_layer_idx)]
         self.use_sequence_parallel_moe = first_layer.use_sequence_parallel_moe
+        # Cover the redundant slots the draft MoE allocates (upstream #57549).
+        self.num_redundant_experts = first_layer.mlp.n_redundant_experts
 
         # Stack the WKV projections from all DSpark layers into one linear.
         #
@@ -401,7 +403,7 @@ class DeepseekV4DSparkModel(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts,
-            num_redundant_experts=0,
+            num_redundant_experts=self.num_redundant_experts,
         )
 
 
