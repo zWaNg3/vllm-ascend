@@ -17,7 +17,6 @@ from functools import partial
 import torch
 from safetensors import safe_open
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
-from vllm.config import VllmConfig
 from vllm.distributed import get_ep_group
 from vllm.logger import logger
 from vllm.model_executor.model_loader.weight_utils import (
@@ -34,33 +33,10 @@ from vllm_ascend.worker.sentinel.eplb_quant_schemes import (
 from vllm_ascend.worker.moe_utils import unwrap_moe
 
 __all__ = [
-    "DRAFTER_SUFFIX_MAP",
     "build_orig_to_dense_rank_table",
     "densify_routing_table_physical_ids",
     "reload_experts_from_disk",
 ]
-
-# Checkpoint name suffixes (relative to "<layer_name>.<expert_id>.") of the
-# tensors a reload may consume. weight_offset is loaded at startup but never
-# consumed by the MoE apply path, so it is not reloaded here.
-_W13_WEIGHT_SUFFIXES = ("gate_up_proj.weight", "gate_proj.weight", "up_proj.weight")
-_W2_WEIGHT_SUFFIX = "down_proj.weight"
-_W13_SCALE_SUFFIXES = ("gate_up_proj.weight_scale", "gate_proj.weight_scale", "up_proj.weight_scale")
-_W2_SCALE_SUFFIX = "down_proj.weight_scale"
-
-# Speculative drafters (MTP/DSpark) hold the same projection tensors as the
-# main model but their checkpoints name them w1/w3 (gate/up) and w2 (down).
-# Translate those onto the bucket names the reloaders consume, so a drafter
-# reload reuses the whole main-model path unchanged: pass this as
-# ``suffix_map`` to ``reload_experts_from_disk``.
-DRAFTER_SUFFIX_MAP = {
-    "w1.weight": "gate_proj.weight",
-    "w3.weight": "up_proj.weight",
-    "w2.weight": "down_proj.weight",
-    "w1.weight_scale": "gate_proj.weight_scale",
-    "w3.weight_scale": "up_proj.weight_scale",
-    "w2.weight_scale": "down_proj.weight_scale",
-}
 
 # Quant schemes the reload supports (gated in _reload_local_slots).
 _SUPPORTED_QUANT_TYPES = {
@@ -265,9 +241,8 @@ def _resolve_expert_tensor(
     return (key, suffix) if key is not None else None
 
 
-def _collect_safetensors_shards(vllm_config: VllmConfig, model: torch.nn.Module) -> list[str]:
+def _collect_safetensors_shards(model_path: str, model: torch.nn.Module) -> list[str]:
     """Collect the safetensors shards the model loads from the local checkpoint directory."""
-    model_path = vllm_config.model_config.model
     if not os.path.isdir(model_path):
         raise RuntimeError(
             f"[FT] scale_down expert reload reads a local checkpoint only, but '{model_path}' is not a directory."
@@ -315,22 +290,18 @@ def _collect_matching_weights(
                 if found is None:
                     continue
                 key, suffix = found
-                matched.add(key)
                 if suffix_map is not None:
-                    # A drafter can reach this point with raw checkpoint
-                    # suffixes ("w1.weight", no declared hf_to_vllm_mapper)
-                    # or already-mapped ones ("gate_proj.weight", normalize
-                    # ran the shared target mapper). Translate only the
-                    # former; discarding the latter would empty the bucket
-                    # for a matched expert.
+                    # Translate raw ("w1.weight"); already-mapped names pass through.
                     suffix = suffix_map.get(suffix, suffix)
                 if suffix in wanted_suffixes:
+                    # Only a collected tensor counts as matched.
+                    matched.add(key)
                     expert_weights.setdefault(key, {})[suffix] = f.get_tensor(raw_name)
 
 
 def reload_experts_from_disk(
     model: torch.nn.Module,
-    vllm_config: VllmConfig,
+    model_path: str,
     reassignments: set[tuple[int, int]],
     suffix_map: dict[str, str] | None = None,
 ) -> int:
@@ -343,12 +314,11 @@ def reload_experts_from_disk(
     ``eplb_state.logical_to_physical_map`` -- hence the call must follow the
     upstream ``rebuild_model_expert_maps``.
 
-    ``suffix_map`` renames the checkpoint's projection suffixes onto the bucket
-    names above, for models whose checkpoint names them differently --
-    speculative drafters (MTP/DSpark) use ``w1/w3/w2``, so pass
-    ``DRAFTER_SUFFIX_MAP``. It is the only per-model difference: the layer
-    names, placement maps, shard selection and name mapper all come from
-    ``model``, so a drafter reload shares this path whole.
+    ``model_path`` is the checkpoint directory ``model`` was loaded from, which
+    for a drafter can differ from the target's (a separate draft checkpoint).
+    ``suffix_map`` renames checkpoint projection suffixes onto the reloaders'
+    bucket names; pass ``DRAFTER_SUFFIX_MAP`` for drafter reloads. All other
+    inputs (layer names, placement maps, shards, name mapper) come from ``model``.
     """
     if not reassignments:
         return 0
@@ -392,12 +362,9 @@ def reload_experts_from_disk(
     matched: set[tuple[int, int]] = set()
 
     logger.info("[FT] Reloading %d reassigned (layer, expert) pair(s) on this rank from disk.", len(local_slots))
-    shards = _collect_safetensors_shards(vllm_config, model)
+    shards = _collect_safetensors_shards(model_path, model)
     if not shards:
-        raise RuntimeError(
-            "[FT] scale_down expert reload requires a safetensors checkpoint; "
-            f"{vllm_config.model_config.model} has none."
-        )
+        raise RuntimeError(f"[FT] scale_down expert reload requires a safetensors checkpoint; {model_path} has none.")
     _collect_matching_weights(shards, name_mapper, wanted, _WANTED_SUFFIXES, expert_weights, matched, suffix_map)
     # A pair with no checkpoint weight would silently keep its slot's previous occupant, so fail.
     unmatched = [layer_expert for layer_expert in local_slots if layer_expert not in matched]
