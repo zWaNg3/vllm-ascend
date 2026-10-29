@@ -38,12 +38,6 @@ __all__ = [
     "reload_experts_from_disk",
 ]
 
-# Quant schemes the reload supports (gated in _reload_local_slots).
-_SUPPORTED_QUANT_TYPES = {
-    AscendUnquantizedFusedMoEMethod,
-    AscendW8A8DynamicFusedMoEMethod,
-}
-
 # (layer, expert) pairs per chunk: a larger chunk amortises the device rounds
 # further but grows the stack's transient device memory.
 _RELOAD_CHUNK_SIZE = 32
