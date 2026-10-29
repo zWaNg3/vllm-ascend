@@ -17,7 +17,6 @@ from functools import partial
 import torch
 from safetensors import safe_open
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
-from vllm.config import VllmConfig
 from vllm.distributed import get_ep_group
 from vllm.logger import logger
 from vllm.model_executor.model_loader.weight_utils import (
@@ -33,22 +32,10 @@ from vllm_ascend.worker.sentinel.eplb_quant_schemes import (
 )
 
 __all__ = [
-    "DRAFTER_SUFFIX_MAP",
     "build_orig_to_dense_rank_table",
     "densify_routing_table_physical_ids",
     "reload_experts_from_disk",
 ]
-
-# Drafter checkpoints (MTP/DSpark) name projections w1/w3 (gate/up) and w2
-# (down); pass this as ``suffix_map`` to ``reload_experts_from_disk``.
-DRAFTER_SUFFIX_MAP = {
-    "w1.weight": "gate_proj.weight",
-    "w3.weight": "up_proj.weight",
-    "w2.weight": "down_proj.weight",
-    "w1.weight_scale": "gate_proj.weight_scale",
-    "w3.weight_scale": "up_proj.weight_scale",
-    "w2.weight_scale": "down_proj.weight_scale",
-}
 
 # (layer, expert) pairs per chunk: bigger chunks amortise device rounds but grow the stacked buffer.
 _RELOAD_CHUNK_SIZE = 32
@@ -227,9 +214,8 @@ def _resolve_expert_tensor(
     return (key, suffix) if key is not None else None
 
 
-def _collect_safetensors_shards(vllm_config: VllmConfig, model: torch.nn.Module) -> list[str]:
+def _collect_safetensors_shards(model_path: str, model: torch.nn.Module) -> list[str]:
     """Collect the safetensors shards the model loads from the local checkpoint directory."""
-    model_path = vllm_config.model_config.model
     if not os.path.isdir(model_path):
         raise RuntimeError(
             f"[FT] scale_down expert reload reads a local checkpoint only, but '{model_path}' is not a directory."
@@ -275,19 +261,18 @@ def _collect_matching_weights(
                 if found is None:
                     continue
                 key, suffix = found
-                matched.add(key)
                 if suffix_map is not None:
-                    # The suffix may be raw ("w1.weight") or already mapped
-                    # by the shared hf_to_vllm_mapper; translate only the
-                    # former, so both namings bucket correctly.
+                    # Translate raw ("w1.weight"); already-mapped names pass through.
                     suffix = suffix_map.get(suffix, suffix)
                 if suffix in wanted_suffixes:
+                    # Only a collected tensor counts as matched.
+                    matched.add(key)
                     expert_weights.setdefault(key, {})[suffix] = f.get_tensor(raw_name)
 
 
 def reload_experts_from_disk(
     model: torch.nn.Module,
-    vllm_config: VllmConfig,
+    model_path: str,
     reassignments: set[tuple[int, int]],
     suffix_map: dict[str, str] | None = None,
 ) -> int:
@@ -299,6 +284,8 @@ def reload_experts_from_disk(
     the slot from ``eplb_state.logical_to_physical_map``; the call must follow
     ``rebuild_model_expert_maps``.
 
+    ``model_path`` is the checkpoint directory ``model`` was loaded from, which
+    for a drafter can differ from the target's (a separate draft checkpoint).
     ``suffix_map`` renames checkpoint projection suffixes onto the reloaders'
     bucket names; pass ``DRAFTER_SUFFIX_MAP`` for drafter reloads. All other
     inputs (layer names, placement maps, shards, name mapper) come from ``model``.
@@ -339,12 +326,9 @@ def reload_experts_from_disk(
     matched: set[tuple[int, int]] = set()
 
     logger.info("[FT] Reloading %d reassigned (layer, expert) pair(s) on this rank from disk.", len(local_slots))
-    shards = _collect_safetensors_shards(vllm_config, model)
+    shards = _collect_safetensors_shards(model_path, model)
     if not shards:
-        raise RuntimeError(
-            "[FT] scale_down expert reload requires a safetensors checkpoint; "
-            f"{vllm_config.model_config.model} has none."
-        )
+        raise RuntimeError(f"[FT] scale_down expert reload requires a safetensors checkpoint; {model_path} has none.")
     _collect_matching_weights(shards, name_mapper, wanted, _WANTED_SUFFIXES, expert_weights, matched, suffix_map)
     # A pair with no checkpoint weight would silently keep its slot's previous occupant, so fail.
     unmatched = [layer_expert for layer_expert in local_slots if layer_expert not in matched]

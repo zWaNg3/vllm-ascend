@@ -30,8 +30,8 @@ from vllm.v1.worker.sentinel.gpu_worker_sentinel import (
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.eplb.eplb_state import refresh_model_routing_tables
 from vllm_ascend.platform import NPUPlatform
+from vllm_ascend.worker.sentinel.eplb_quant_schemes import DRAFTER_SUFFIX_MAP
 from vllm_ascend.worker.sentinel.eplb_redistribute import (
-    DRAFTER_SUFFIX_MAP,
     build_orig_to_dense_rank_table,
     densify_routing_table_physical_ids,
     reload_experts_from_disk,
@@ -159,6 +159,7 @@ class WorkerSentinel(GPUWorkerSentinel):
             raise ValueError(
                 "[FT] scale_down requires EPLB with num_redundant_experts > 0 to re-host the dead rank's experts."
             )
+        self._validate_drafter_eplb_coverage(model_runner)
         ascend_config = get_ascend_config()
         if ascend_config.enable_fused_mc2:
             raise ValueError(
@@ -187,20 +188,22 @@ class WorkerSentinel(GPUWorkerSentinel):
         the densified id space and shrinks the MC2 physical-expert width.
 
         Each EPLB-registered model (main model and drafter) is redistributed
-        against its own placement; results are never shared across models.
+        against its own placement and reloaded from its own checkpoint; results
+        are never shared across models.
         """
         model_runner = self.worker.model_runner
 
-        models: list[tuple[torch.nn.Module, EplbModelState, dict[str, str] | None]] = [
-            (model_runner.model, self._eplb_model_state(), None)
+        models: list[tuple[torch.nn.Module, EplbModelState, str, dict[str, str] | None]] = [
+            (model_runner.model, self._eplb_model_state(), self.worker.vllm_config.model_config.model, None)
         ]
         drafter = self._registered_drafter(model_runner)
         if drafter is not None:
             draft_model, draft_state = drafter
-            models.append((draft_model, draft_state, DRAFTER_SUFFIX_MAP))
+            # A drafter may have its own checkpoint; reload from that one.
+            models.append((draft_model, draft_state, self._drafter_checkpoint_path(), DRAFTER_SUFFIX_MAP))
 
         ep_world_size = get_ep_group().world_size
-        for model, model_state, suffix_map in models:
+        for model, model_state, model_path, suffix_map in models:
             p2l = model_state.physical_to_logical_map
             num_logical = model_state.logical_replica_count.shape[1]
             num_local_experts = p2l.shape[1] // ep_world_size
@@ -216,12 +219,13 @@ class WorkerSentinel(GPUWorkerSentinel):
                 num_logical,
                 len(reassignments),
             )
-            self._apply_placement(model, model_state, reassignments, suffix_map=suffix_map)
+            self._apply_placement(model, model_state, model_path, reassignments, suffix_map=suffix_map)
 
     def _apply_placement(
         self,
         model: torch.nn.Module,
         model_state: EplbModelState,
+        model_path: str,
         reassignments: set[tuple[int, int]],
         suffix_map: dict[str, str] | None = None,
     ) -> None:
@@ -232,25 +236,53 @@ class WorkerSentinel(GPUWorkerSentinel):
         _commit_eplb_maps(model_state, p2l.cpu())
         rebuild_model_expert_maps(model, p2l, num_local_experts)
         if reassignments:
-            reload_experts_from_disk(model, self.worker.vllm_config, reassignments, suffix_map=suffix_map)
+            reload_experts_from_disk(model, model_path, reassignments, suffix_map=suffix_map)
         refresh_model_routing_tables(model_state)
         self._densify_routing_tables(model_state)
 
-    def _registered_drafter(self, model_runner) -> tuple[torch.nn.Module, EplbModelState] | None:
-        """Return the speculative drafter and its EPLB state, if EPLB has one."""
-        draft_model = getattr(getattr(model_runner, "speculator", None), "model", None)
-        # EPLB registers a MoE drafter only (same gate as
-        # maybe_register_speculator); keying off moe_layers would over-admit.
-        draft_moe = get_mixture_of_experts_model(draft_model)
+    @staticmethod
+    def _drafter_model(model_runner) -> torch.nn.Module | None:
+        """The speculative drafter the runner loaded, if any."""
+        return getattr(getattr(model_runner, "speculator", None), "model", None)
+
+    def _drafter_eplb_state(self, model_runner) -> EplbModelState | None:
+        """The drafter's EPLB state; None unless EPLB registered its MoE part."""
+        draft_moe = get_mixture_of_experts_model(self._drafter_model(model_runner))
         if draft_moe is None:
             return None
         for model_state in model_runner.eplb_state.model_states.values():
             if model_state.model is draft_moe:
-                return draft_model, model_state
-        raise RuntimeError(
-            "[FT] the drafter is a MoE model and EPLB accepted it at load, but has no model "
-            "state for it now; its placement would keep pointing at dead ranks."
-        )
+                return model_state
+        return None
+
+    def _registered_drafter(self, model_runner) -> tuple[torch.nn.Module, EplbModelState] | None:
+        """Return the speculative drafter and its EPLB state, if EPLB has one."""
+        model_state = self._drafter_eplb_state(model_runner)
+        if model_state is None:
+            return None
+        return self._drafter_model(model_runner), model_state
+
+    def _drafter_checkpoint_path(self) -> str:
+        """Checkpoint directory the drafter was loaded from (may differ from the target's)."""
+        speculative_config = getattr(self.worker.vllm_config, "speculative_config", None)
+        draft_model_config = getattr(speculative_config, "draft_model_config", None)
+        if draft_model_config is not None:
+            return draft_model_config.model
+        return self.worker.vllm_config.model_config.model
+
+    def _validate_drafter_eplb_coverage(self, model_runner) -> None:
+        """Reject a MoE drafter EPLB did not register (e.g. V4.1 DSpark).
+
+        It would keep routing to the dead rank after the group shrinks.
+        """
+        drafter = self._drafter_model(model_runner)
+        has_moe = get_mixture_of_experts_model(drafter) is not None or bool(getattr(drafter, "moe_layers", None))
+        if has_moe and self._drafter_eplb_state(model_runner) is None:
+            raise ValueError(
+                "[FT] scale_down does not support a MoE drafter that EPLB did not register "
+                "(e.g. a V4.1 DSpark draft, or a draft with its own EPLB disabled): its "
+                "expert placement would keep pointing at the dead rank."
+            )
 
     def _densify_routing_tables(self, eplb_model_state) -> None:
         """Renumber the kernel-facing routing tables into the densified id space.
