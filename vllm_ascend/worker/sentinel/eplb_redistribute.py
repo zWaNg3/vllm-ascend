@@ -275,7 +275,7 @@ def reload_experts_from_disk(
     lists, derived quant scales), so ``model.load_weights`` cannot write them
     back. Only experts landing in this rank's physical block are reloaded, into
     the slot from ``eplb_state.logical_to_physical_map``; the call must follow
-    ``rebuild_model_expert_maps``.
+    ``_commit_eplb_maps``, which derives that map from the recovered placement.
     """
     if not reassignments:
         return 0
