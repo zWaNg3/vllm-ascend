@@ -45,6 +45,7 @@ from vllm.distributed import (
 )
 from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory, fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -117,6 +118,8 @@ if vllm_version_is("0.32.0"):
     from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config  # type: ignore[import-not-found]
 else:
     from transformers import DeepseekV4Config
+
+logger = init_logger(__name__)
 
 sequence_parallel_chunk = sp_shard
 
@@ -226,6 +229,26 @@ def get_spec_layer_idx_from_weight_name(config: DeepseekV2Config | DeepseekV3Con
     if weight_name.startswith("mtp."):
         return 0
     return None
+
+
+# Decoder-layer weights are named ``model.layers.<index>.*`` after the
+# checkpoint-name mapping; this segment yields the decoder-layer index.
+_LAYER_WEIGHT_NAME_PATTERN = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+
+def is_trimmed_layer_weight(weight_name: str, num_model_layers: int) -> bool:
+    """Whether a checkpoint weight belongs to a decoder layer that was not built.
+
+    DeepSeek-V4 layer trimming builds only the first ``num_hidden_layers``
+    decoder layers (``--hf-overrides '{"num_hidden_layers": N}'``), while the
+    checkpoint still ships the full stack. The tail-layer weights have no
+    destination parameter, so ``load_weights`` must skip them instead of
+    raising a ``KeyError``.
+    """
+    match = _LAYER_WEIGHT_NAME_PATTERN.search(weight_name)
+    if match is None:
+        return False
+    return int(match.group(1)) >= num_model_layers
 
 
 class DeepseekV2MLP(nn.Module):
@@ -1237,6 +1260,10 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        # ``make_layers`` pads non-local pipeline stages with PPMissingLayer, so
+        # this is always the configured (possibly trimmed) layer count.
+        num_model_layers = len(self.model.layers)
+        trimmed_layer_weight_count = 0
 
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
@@ -1255,6 +1282,9 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                 continue  # mapper-declared drop (none today; parity with AutoWeightsLoader)
             name = mapped_name
 
+            if is_trimmed_layer_weight(name, num_model_layers):
+                trimmed_layer_weight_count += 1
+                continue
             if "rotary_emb.inv_freq" in name:
                 continue
             if ".gate.bias_vl" in name:
@@ -1431,4 +1461,12 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
             if not is_fusion_moe_shared_experts_layer:
                 loaded_params.add(name)
 
+        if trimmed_layer_weight_count:
+            logger.warning_once(
+                "Skipped %d checkpoint weights for decoder layers >= %d: the "
+                "model was built with a trimmed layer stack "
+                "(num_hidden_layers override). Output quality is reduced.",
+                trimmed_layer_weight_count,
+                num_model_layers,
+            )
         return loaded_params
