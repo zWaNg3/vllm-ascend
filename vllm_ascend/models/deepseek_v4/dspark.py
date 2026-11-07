@@ -50,6 +50,7 @@ from vllm_ascend.models.deepseek_v4.model import (
     DeepseekV4DecoderLayer,
     DeepseekV4MoE,
 )
+from vllm_ascend.models.qwen3_dspark import align_draft_weights
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
 from vllm_ascend.utils import enable_dsa_cp
 
@@ -452,6 +453,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts, Support
         self.extract_moe_parameters(example_moe)
         # EPLB identifies a MoE model via num_moe_layers > 0
         self.num_moe_layers = len(self.moe_layers)
+
+    def post_process(self, vllm_config: VllmConfig) -> None:
+        """Align the draft with a QuaRot-rotated target (main_proj, embed, lm_head)."""
+        align_draft_weights(self, self.model.main_proj, vllm_config)
 
     def forward(
         self,
