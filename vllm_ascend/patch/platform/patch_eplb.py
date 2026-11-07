@@ -643,6 +643,21 @@ def _wrap_async_worker(original_worker):
                     consumed_event.wait(stream=stream)
                     assert model_state.pending_result is None
 
+    def _wait_for_recovery_round(state, stream, failed_epoch) -> bool:
+        """Consume rearrangement wakeups until a recovery round resets EPLB.
+
+        ``rearrange_event`` is a one-shot handshake: every wakeup must be
+        consumed, otherwise the foreground's next ``record()`` fails. Waiting
+        here also keeps a broken cycle from being retried on every rebalance
+        trigger before the recovery round has rebuilt the groups.
+
+        Returns False when the async loop is asked to stop.
+        """
+        while state.wait_for_rearrangement(stream):
+            if failed_epoch is None or getattr(state, "ft_reset_epoch", None) != failed_epoch:
+                return True
+        return False
+
     @wraps(original_worker)
     def _transfer_run_periodically(*args, **kwargs):
         bound = worker_signature.bind(*args, **kwargs)
@@ -652,17 +667,34 @@ def _wrap_async_worker(original_worker):
         is_profile = bound.arguments["is_profile"]
         if not isinstance(state, AscendEplbState) or is_profile:
             return original_worker(*bound.args, **bound.kwargs)
-        try:
-            return _run(state, stream, is_profile)
-        except Exception as error:
-            if state._hixl_session is not None:
-                # Context restoration and the final stream synchronization also
-                # belong to the migration. Preserve ownership on any failure.
-                session = state._hixl_session
-                if session._error is None:
-                    session._error = error
-                session._usable = False
-            raise
+        parallel_config = getattr(state, "parallel_config", None)
+        fault_tolerant = bool(getattr(parallel_config, "enable_fault_tolerance", False))
+        while True:
+            reset_epoch = getattr(state, "ft_reset_epoch", None)
+            try:
+                return _run(state, stream, is_profile)
+            except Exception as error:
+                if not fault_tolerant:
+                    if state._hixl_session is not None:
+                        # Context restoration and the final stream synchronization
+                        # also belong to the migration. Preserve ownership on any
+                        # failure.
+                        session = state._hixl_session
+                        if session._error is None:
+                            session._error = error
+                        session._usable = False
+                    raise
+                # FT keeps the thread alive so the worker survives the peer that
+                # broke the EPLB group and can resume after the recovery round.
+                # Marking the HIXL session failed here would instead make
+                # raise_if_close_failed() terminate the worker on its next step,
+                # before the recovery round can rebuild the groups.
+                logger.exception(
+                    "[FT] EPLB async loop failed; waiting for the recovery round: %s",
+                    error,
+                )
+                if not _wait_for_recovery_round(state, stream, reset_epoch):
+                    return
 
     setattr(_transfer_run_periodically, _PATCH_MARKER, True)
     return _transfer_run_periodically
