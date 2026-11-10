@@ -8,9 +8,12 @@ import vllm.config.speculative as speculative_config
 from transformers import DeepseekV2Config, PretrainedConfig
 from vllm.config.model import ModelConfig
 from vllm.config.speculative import SpeculativeConfig
+from vllm.logger import init_logger
 from vllm.transformers_utils.configs.speculators import SpeculatorsConfig
 
 from vllm_ascend.utils import is_deepseek_v41, is_gqa_pcp_dcp_config
+
+logger = init_logger(__name__)
 
 _orig_post_init = SpeculativeConfig.__post_init__
 _orig_hf_config_override = SpeculativeConfig.hf_config_override
@@ -117,7 +120,56 @@ def _normalize_legacy_qwen3_dspark_config(
     return hf_config
 
 
-def _normalize_deepseek_dspark_draft(draft_model_config) -> None:
+def _rebase_trimmed_dspark_taps(
+    draft_text_config: PretrainedConfig,
+    target_model_config,
+    is_deepseek_v41_model: bool,
+) -> None:
+    """Move DSpark's target taps inside a trimmed decoder stack.
+
+    ``--hf-overrides '{"num_hidden_layers": N}'`` builds fewer decoder layers
+    than the checkpoint's DSpark taps reference. The auxiliary capture then
+    never fires, the target returns a bare tensor, and the model runner
+    rejects it when the drafter needs auxiliary hidden states. Rebase the taps
+    onto the last layers of the built stack: the tap count (which sets the
+    draft's input width) is preserved, so the draft still loads. Its features
+    come from a shallower context, so draft quality degrades with the trim.
+    """
+    layer_ids = getattr(draft_text_config, "dspark_target_layer_ids", None)
+    if not layer_ids or target_model_config is None:
+        return
+    target_text_config = getattr(target_model_config, "hf_text_config", None) or getattr(
+        target_model_config, "hf_config", None
+    )
+    num_target_layers = getattr(target_text_config, "num_hidden_layers", None)
+    if not isinstance(num_target_layers, int) or num_target_layers <= 0:
+        return
+    # v4 taps are capture-after decoder-layer indices, so the last valid index
+    # is ``num_hidden_layers - 1``; v4.1 taps are capture boundaries, valid
+    # through ``num_hidden_layers``. Mirrors vLLM's aux-layer resolution.
+    last_valid = num_target_layers if is_deepseek_v41_model else num_target_layers - 1
+    if max(layer_ids) <= last_valid:
+        return
+    if len(layer_ids) > num_target_layers:
+        logger.warning_once(
+            "DSpark has %d target taps but the target builds only %d decoder layers; "
+            "keeping the checkpoint taps, so auxiliary capture stays empty.",
+            len(layer_ids),
+            num_target_layers,
+        )
+        return
+    rebased = list(range(num_target_layers - len(layer_ids), num_target_layers))
+    draft_text_config.dspark_target_layer_ids = rebased
+    logger.warning_once(
+        "DSpark target layers %s exceed the trimmed decoder stack (%d layers); "
+        "rebased the auxiliary taps to %s. Draft quality is reduced.",
+        list(layer_ids),
+        num_target_layers,
+        rebased,
+    )
+
+
+def _normalize_deepseek_dspark_draft(draft_model_config, target_model_config=None) -> None:
     """Restore the DSpark draft architecture after VL config conversion.
 
     DeepSeek-V4-Vision uses the same checkpoint for the target and DSpark
@@ -139,6 +191,8 @@ def _normalize_deepseek_dspark_draft(draft_model_config) -> None:
         or getattr(draft_text_config, "dspark_target_layer_ids", None) is None
     ):
         return
+
+    _rebase_trimmed_dspark_taps(draft_text_config, target_model_config, is_deepseek_v41_model)
 
     architecture = "DeepseekV41DSparkModel" if is_deepseek_v41_model else "DSparkDraftModel"
     if is_deepseek_v41_model:
@@ -208,7 +262,7 @@ def _dspark_post_init(self):
     if self.use_dspark():
         draft_model_config = getattr(self, "draft_model_config", None)
         draft_hf_config = getattr(draft_model_config, "hf_config", None)
-        _normalize_deepseek_dspark_draft(draft_model_config)
+        _normalize_deepseek_dspark_draft(draft_model_config, getattr(self, "target_model_config", None))
         # deepseek v4 dspark
         if getattr(draft_hf_config, "ptd_token_id", None) is None:  # type: ignore
             draft_hf_config.ptd_token_id = getattr(draft_hf_config, "dspark_noise_token_id", None)  # type: ignore
