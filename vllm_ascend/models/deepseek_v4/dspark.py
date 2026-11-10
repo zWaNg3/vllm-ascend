@@ -442,6 +442,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts, Support
                 self.moe_layers.append(layer.mlp.experts)
 
         self.extract_moe_parameters(example_moe)
+        # EPLB registers a draft only through `is_mixture_of_experts`
+        # (num_moe_layers > 0). The draft MoE is built with the target's EPLB
+        # geometry, so leaving it unregistered would keep an uninitialized
+        # EplbLayerState on its routers and fail the first forward.
+        self.num_moe_layers = len(self.moe_layers)
 
     def forward(
         self,
