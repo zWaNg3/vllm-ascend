@@ -129,7 +129,9 @@ class DeepseekV4DSparkModel(nn.Module):
             {
                 str(self.mtp_start_layer_idx + idx): DeepseekV4DecoderLayer(
                     vllm_config,
-                    prefix=f"mtp.{idx}",
+                    # Keep the parent prefix: the quant description keys use the
+                    # mapper's "model.mtp.N" namespace, not a bare "mtp.N".
+                    prefix=maybe_prefix(prefix, f"mtp.{idx}"),
                     is_draft_layer=True,
                 )
                 for idx in range(self.num_dspark_layers)
@@ -159,7 +161,7 @@ class DeepseekV4DSparkModel(nn.Module):
             bias=False,
             return_bias=False,
             quant_config=vllm_config.quant_config,
-            prefix="mtp.0.self_attn.wkv",
+            prefix=maybe_prefix(prefix, "mtp.0.self_attn.wkv"),
             disable_tp=True,
         )
 
