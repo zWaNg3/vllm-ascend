@@ -160,12 +160,14 @@ def _rebase_trimmed_dspark_taps(
         return
     rebased = list(range(num_target_layers - len(layer_ids), num_target_layers))
     draft_text_config.dspark_target_layer_ids = rebased
+    # warning_once keys its dedup cache on the arguments, so pass hashable
+    # tuples rather than the lists.
     logger.warning_once(
         "DSpark target layers %s exceed the trimmed decoder stack (%d layers); "
         "rebased the auxiliary taps to %s. Draft quality is reduced.",
-        list(layer_ids),
+        tuple(layer_ids),
         num_target_layers,
-        rebased,
+        tuple(rebased),
     )
 
 
