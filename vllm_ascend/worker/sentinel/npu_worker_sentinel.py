@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 from functools import wraps
 from typing import TYPE_CHECKING
@@ -41,6 +43,7 @@ from vllm_ascend.worker.sentinel.eplb_redistribute import (
     reload_experts_from_disk,
     validate_reload_checkpoint,
 )
+from vllm_ascend.worker.sentinel.ft_metrics import FtRecoveryMetrics, format_metrics
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_worker import Worker
@@ -111,15 +114,44 @@ class WorkerSentinel(GPUWorkerSentinel):
         # device until FT recovery rebuilds the groups.
         self.worker_faulted = False
         self.fault_info: str | None = None
+        # Recovery metrics: one object per round, shared with a nested retry.
+        self._metrics: FtRecoveryMetrics | None = None
+        self._fault_at: float | None = None
         _sentinel = self
 
     def mark_faulted(self, exc: Exception) -> None:
         """Record the first device-touching fault for the barrier."""
+        if not self.worker_faulted:
+            self._fault_at = time.perf_counter()
         self.worker_faulted = True
         self.fault_info = f"{type(exc).__name__}: {exc}"
 
     def faulted_message(self) -> str:
         return f"[FT] worker is quarantined after fault: {self.fault_info}"
+
+    @contextmanager
+    def _recovery_round(self, instruction: str) -> Iterator[FtRecoveryMetrics]:
+        """Collect metrics for one command; a nested retry shares its parent's."""
+        outer = self._metrics is not None
+        metrics = self._metrics or FtRecoveryMetrics(instruction)
+        if not outer:
+            if self._fault_at is not None:
+                metrics.add_phase("fault_to_command", metrics.started_at - self._fault_at)
+            self._metrics = metrics
+        try:
+            yield metrics
+        finally:
+            if not outer:
+                self._metrics = None
+                # One line per engine/TP group; workers share the same process log.
+                if self.worker.rank == 0:
+                    logger.info(
+                        "[FT] %s on rank %d took %.2f s: %s",
+                        metrics.instruction,
+                        self.worker.rank,
+                        metrics.total_s,
+                        format_metrics(metrics.phases, metrics.values),
+                    )
 
     def query_mask(self, ft_request: FaultToleranceRequest) -> dict:
         """Report the dead-rank mask (upstream convention: 0=live, 1=dead)."""
@@ -135,10 +167,14 @@ class WorkerSentinel(GPUWorkerSentinel):
     def retry(self, ft_request: FaultToleranceRequest):
         # Reset first so hung device collectives are aborted, then run the
         # base flow and lift the quarantine after the groups are rebuilt.
-        self.reset_device()
-        super().retry(ft_request)
+        with self._recovery_round("retry") as metrics:
+            with metrics.phase("reset_device"):
+                self.reset_device()
+            with metrics.phase("group_reinit"):
+                super().retry(ft_request)
         self.worker_faulted = False
         self.fault_info = None
+        self._fault_at = None
 
     def init_num_local_experts(self) -> None:
         """Record the per-rank physical expert slot count after model load."""
@@ -156,19 +192,24 @@ class WorkerSentinel(GPUWorkerSentinel):
         to the Ascend overrides below. Ascend adds its platform preconditions
         and a dummy-batch runnability check on top.
         """
-        self._validate_scale_down_preconditions()
-        super().scale_down(ft_request)
+        with self._recovery_round("scale_down") as metrics:
+            with metrics.phase("preconditions"):
+                self._validate_scale_down_preconditions()
+            super().scale_down(ft_request)
 
-        # Verify the redistributed model is runnable before reporting healthy.
-        parallel_config = self.worker.parallel_config
-        timeout = timedelta(seconds=self.worker.parallel_config.fault_tolerance_config.engine_recovery_timeout_sec)
-        if parallel_config.data_parallel_size > 1:
-            set_gloo_backend_timeout(get_dp_group().cpu_group, timeout)
-        if parallel_config.tensor_parallel_size > 1:
-            set_gloo_backend_timeout(get_tp_group().cpu_group, timeout)
-        self.worker.execute_dummy_batch()
-        self.activate_cpu_group_timeouts(ft_request)
-        torch.npu.synchronize()
+            # Verify the redistributed model is runnable before reporting healthy.
+            parallel_config = self.worker.parallel_config
+            timeout = timedelta(seconds=self.worker.parallel_config.fault_tolerance_config.engine_recovery_timeout_sec)
+            if parallel_config.data_parallel_size > 1:
+                set_gloo_backend_timeout(get_dp_group().cpu_group, timeout)
+            if parallel_config.tensor_parallel_size > 1:
+                set_gloo_backend_timeout(get_tp_group().cpu_group, timeout)
+            with metrics.phase("dummy_batch"):
+                self.worker.execute_dummy_batch()
+            with metrics.phase("cpu_timeouts"):
+                self.activate_cpu_group_timeouts(ft_request)
+            torch.npu.synchronize()
+        self._fault_at = None
 
     def _validate_reload_checkpoints(self) -> None:
         """Reject a checkpoint the reload cannot read before recovery starts."""
@@ -270,8 +311,13 @@ class WorkerSentinel(GPUWorkerSentinel):
                 )
             models.append(drafter)
 
-        for model, model_state, model_config, load_config in models:
-            self._redistribute_model(model, model_state, model_config, load_config, dead_ep_ranks)
+        with self._phase("redistribute"):
+            for model, model_state, model_config, load_config in models:
+                self._redistribute_model(model, model_state, model_config, load_config, dead_ep_ranks)
+
+    def _phase(self, name: str):
+        """Time ``name`` when a recovery round is active; a no-op otherwise."""
+        return self._metrics.phase(name) if self._metrics is not None else nullcontext()
 
     def _redistribute_model(
         self,
@@ -286,8 +332,12 @@ class WorkerSentinel(GPUWorkerSentinel):
         num_logical = model_state.logical_replica_count.shape[1]
         num_local_experts = _num_local_experts(model_state)
 
-        mark_dead_expert_slots_inplace(p2l, dead_ep_ranks, num_local_experts)
-        reassignments = redistribute_expert_placement(p2l, num_logical, num_local_experts)
+        with self._phase("placement"):
+            mark_dead_expert_slots_inplace(p2l, dead_ep_ranks, num_local_experts)
+            reassignments = redistribute_expert_placement(p2l, num_logical, num_local_experts)
+        if self._metrics is not None:
+            self._metrics.add_value("models", 1)
+            self._metrics.add_value("reassignments", len(reassignments))
         logger.info(
             "[FT] %s expert redistribution: moe_layers=%d, num_logical=%d, reassignments=%d",
             type(model).__name__,
@@ -295,13 +345,16 @@ class WorkerSentinel(GPUWorkerSentinel):
             num_logical,
             len(reassignments),
         )
-        _commit_eplb_maps(model_state, p2l.cpu())
+        with self._phase("commit_maps"):
+            _commit_eplb_maps(model_state, p2l.cpu())
         # Keep the model-side expert map: slot ownership is unchanged, and the
         # map is physical-id indexed, so p2l (logical ids) must not be written into it.
         if reassignments:
-            reload_experts_from_disk(model, model_config, load_config, reassignments)
-        refresh_model_routing_tables(model_state)
-        self._densify_routing_tables(model_state)
+            with self._phase("reload"):
+                reload_experts_from_disk(model, model_config, load_config, reassignments, metrics=self._metrics)
+        with self._phase("routing_tables"):
+            refresh_model_routing_tables(model_state)
+            self._densify_routing_tables(model_state)
 
     def _resolve_drafter(self) -> tuple[torch.nn.Module, EplbModelState, ModelConfig, LoadConfig] | None:
         """Resolve the drafter's EPLB state and checkpoint, rejecting unregistered MoE."""

@@ -11,6 +11,7 @@ checkpoint into each rank's local slots.
 import os
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from functools import partial
 
 import torch
@@ -27,6 +28,7 @@ from vllm_ascend.worker.sentinel.eplb_quant_schemes import (
     _resolve_scheme,
     _WeightPipeline,
 )
+from vllm_ascend.worker.sentinel.ft_metrics import FtRecoveryMetrics
 
 __all__ = [
     "densify_routing_table_physical_ids",
@@ -39,6 +41,13 @@ _RELOAD_CHUNK_SIZE = 32
 
 # Threads assembling one chunk; bounded because worker processes share host memory bandwidth.
 _GATHER_MAX_WORKERS = 8
+
+_BYTES_PER_MIB = 1024 * 1024
+
+
+def _phase(metrics: FtRecoveryMetrics | None, name: str):
+    """Time ``name`` when metrics are collected; a no-op otherwise."""
+    return metrics.phase(name) if metrics is not None else nullcontext()
 
 
 def densify_routing_table_physical_ids(
@@ -82,6 +91,7 @@ def _reload_local_slots(
     routed_layers: list,
     local_slots: dict[tuple[int, int], int],
     expert_weights: dict[tuple[int, int], dict[str, torch.Tensor]],
+    metrics: FtRecoveryMetrics | None = None,
 ) -> int:
     """Reload all local (layer, expert) pairs in scheme-uniform chunks.
 
@@ -105,7 +115,7 @@ def _reload_local_slots(
     for (reload_scheme, _layout), layer_experts in groups.items():
         for start in range(0, len(layer_experts), _RELOAD_CHUNK_SIZE):
             chunk = layer_experts[start : start + _RELOAD_CHUNK_SIZE]
-            reloaded += _reload_chunk(reload_scheme, routed_layers, chunk, local_slots, expert_weights)
+            reloaded += _reload_chunk(reload_scheme, routed_layers, chunk, local_slots, expert_weights, metrics)
     return reloaded
 
 
@@ -132,6 +142,7 @@ def _reload_chunk(
     layer_experts: list[tuple[int, int]],
     local_slots: dict[tuple[int, int], int],
     expert_weights: dict[tuple[int, int], dict[str, torch.Tensor]],
+    metrics: FtRecoveryMetrics | None = None,
 ) -> int:
     """Apply one chunk of pairs sharing a scheme and per-slot layout.
 
@@ -157,6 +168,9 @@ def _reload_chunk(
         device_tensors[attr] = stacked.to(device=ref.device, dtype=ref.dtype)
     for attr in _WEIGHT_ATTRS:
         device_tensors[attr] = scheme.cast_layout(device_tensors[attr])
+    if metrics is not None:
+        written_bytes = sum(tensor.numel() * tensor.element_size() for tensor in device_tensors.values())
+        metrics.add_value("runtime_written_mib", written_bytes / _BYTES_PER_MIB)
 
     # Scatter phase: non-blocking copies drained by one sync.
     for i, layer_expert in enumerate(layer_experts):
@@ -234,6 +248,7 @@ def _collect_matching_weights(
     shards: list[str],
     name_mapper: Callable[[str], str],
     wanted: dict[str, dict[int, tuple[int, int]]],
+    metrics: FtRecoveryMetrics | None = None,
 ) -> dict[tuple[int, int], dict[str, torch.Tensor]]:
     """Read only the wanted experts' tensors by walking shard headers.
 
@@ -249,7 +264,14 @@ def _collect_matching_weights(
                     continue
                 key, suffix = found
                 if suffix in _WANTED_SUFFIXES:
-                    expert_weights.setdefault(key, {})[suffix] = f.get_tensor(raw_name)
+                    tensor = f.get_tensor(raw_name)
+                    expert_weights.setdefault(key, {})[suffix] = tensor
+                    if metrics is not None:
+                        metrics.add_value("checkpoint_tensors", 1)
+                        metrics.add_value(
+                            "checkpoint_read_mib",
+                            tensor.numel() * tensor.element_size() / _BYTES_PER_MIB,
+                        )
     return expert_weights
 
 
@@ -282,6 +304,7 @@ def reload_experts_from_disk(
     model_config: ModelConfig,
     load_config: LoadConfig,
     reassignments: set[tuple[int, int]],
+    metrics: FtRecoveryMetrics | None = None,
 ) -> int:
     """Reload reassigned (moe_layer_idx, logical_expert_id) weights from disk.
 
@@ -311,8 +334,9 @@ def reload_experts_from_disk(
         wanted.setdefault(routed_layers[layer_idx].layer_name, {})[logical_id] = (layer_idx, logical_id)
 
     logger.info("[FT] Reloading %d reassigned (layer, expert) pair(s) on this rank from disk.", len(local_slots))
-    shards = _collect_safetensors_shards(model_config, load_config, model)
-    expert_weights = _collect_matching_weights(shards, name_mapper, wanted)
+    with _phase(metrics, "reload_scan"):
+        shards = _collect_safetensors_shards(model_config, load_config, model)
+        expert_weights = _collect_matching_weights(shards, name_mapper, wanted, metrics)
     # A pair with no checkpoint weight would silently keep its slot's previous occupant, so fail.
     unmatched = [layer_expert for layer_expert in local_slots if layer_expert not in expert_weights]
     if unmatched:
@@ -325,7 +349,10 @@ def reload_experts_from_disk(
             "an hf_to_vllm_mapper declared on the model class."
         )
 
-    reloaded = _reload_local_slots(routed_layers, local_slots, expert_weights)
+    with _phase(metrics, "reload_apply"):
+        reloaded = _reload_local_slots(routed_layers, local_slots, expert_weights, metrics)
+    if metrics is not None:
+        metrics.add_value("reloaded_pairs", reloaded)
 
     logger.info("[FT] Expert weight reload complete: %d (layer, expert) pair(s).", reloaded)
     return reloaded

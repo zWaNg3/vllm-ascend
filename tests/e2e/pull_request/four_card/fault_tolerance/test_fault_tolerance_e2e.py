@@ -8,6 +8,7 @@ scale-down additionally behind ``has_npu_scale_down_capability()`` (CANN V3+).
 
 import contextlib
 import json
+import logging
 import os
 import threading
 import time
@@ -25,6 +26,8 @@ from tests.e2e.conftest import RemoteOpenAIServer
 
 MODEL_NAME = os.getenv("MODEL_NAME", "vllm-ascend/Qwen3-30B-A3B-W8A8")
 DP_SIZE = 4
+
+logger = logging.getLogger(__name__)
 
 # Fault-detection timeout budget:
 # - CPU: Gloo DP allreduce timeout detects the dead peer.
@@ -574,6 +577,7 @@ def test_scale_down_removes_dead_rank_and_recovers():
         _assert_serving_and_healthy(all_ranks)
 
         # 2. Kill the victim's worker; survivors detect the peer fault.
+        kill_at = time.monotonic()
         _kill_worker_process(victim)
         with _driving(*all_ranks):
             faulted_results = _wait_for_engines(
@@ -581,6 +585,7 @@ def test_scale_down_removes_dead_rank_and_recovers():
                 match_key="status",
                 match_values={"dead", "unhealthy"},
             )
+        detection_s = time.monotonic() - kill_at
 
         for rank, engine_status in enumerate(faulted_results):
             assert engine_status is not None, (
@@ -604,6 +609,7 @@ def test_scale_down_removes_dead_rank_and_recovers():
         assert "status is DEAD" in ft_error, ft_error
 
         # 5. scale_down to every survivor: remove the dead rank.
+        command_at = time.monotonic()
         round_id = str(uuid.uuid4())
         for server in survivors:
             _apply_ft(
@@ -626,6 +632,12 @@ def test_scale_down_removes_dead_rank_and_recovers():
                 "expert redistribution or weight reload likely failed"
             )
         _in_parallel(lambda s: _complete(s.get_client()), survivors)
+        logger.info(
+            "[FT] scale_down e2e: fault_detection=%.2f s, command_to_healthy=%.2f s, kill_to_healthy=%.2f s",
+            detection_s,
+            time.monotonic() - command_at,
+            time.monotonic() - kill_at,
+        )
 
         # 7. Factual answers on the survivors: the re-hosted experts must
         #    produce correct completions on the shrunken DP group.
