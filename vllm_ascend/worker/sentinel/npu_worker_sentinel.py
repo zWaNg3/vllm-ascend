@@ -38,6 +38,7 @@ from vllm_ascend.ascend_forward_context import (
 )
 from vllm_ascend.distributed.eplb.eplb_state import refresh_model_routing_tables
 from vllm_ascend.platform import NPUPlatform
+from vllm_ascend.worker.sentinel.eplb_layerwise_reload import reload_experts_layerwise
 from vllm_ascend.worker.sentinel.eplb_redistribute import (
     densify_routing_table_physical_ids,
     reload_experts_from_disk,
@@ -100,6 +101,12 @@ class WorkerSentinel(GPUWorkerSentinel):
     MC2 elastic_info masking + expert redistribution on scale_down.
     """
 
+    # Expert reload implementation:
+    # - "layerwise": upstream-style whole-layer reload through model.load_weights
+    #   (reference baseline; reads the whole checkpoint);
+    # - "ascend": selective in-place reload of the reassigned experts (production).
+    reload_impl = "layerwise"
+
     def __init__(self, worker: "Worker", device: torch.device):
         # Upstream's platform-independent guards; MoE drafts are supported here,
         # so its draft check is intentionally omitted.
@@ -117,6 +124,8 @@ class WorkerSentinel(GPUWorkerSentinel):
         # Recovery metrics: one object per round, shared with a nested retry.
         self._metrics: FtRecoveryMetrics | None = None
         self._fault_at: float | None = None
+        if self.reload_impl not in ("layerwise", "ascend"):
+            raise ValueError(f"[FT] unknown expert reload implementation {self.reload_impl!r}.")
         _sentinel = self
 
     def mark_faulted(self, exc: Exception) -> None:
@@ -351,7 +360,18 @@ class WorkerSentinel(GPUWorkerSentinel):
         # map is physical-id indexed, so p2l (logical ids) must not be written into it.
         if reassignments:
             with self._phase("reload"):
-                reload_experts_from_disk(model, model_config, load_config, reassignments, metrics=self._metrics)
+                if self.reload_impl == "layerwise":
+                    reload_experts_layerwise(
+                        model,
+                        model_config,
+                        load_config,
+                        reassignments,
+                        p2l,
+                        num_logical,
+                        metrics=self._metrics,
+                    )
+                else:
+                    reload_experts_from_disk(model, model_config, load_config, reassignments, metrics=self._metrics)
         with self._phase("routing_tables"):
             refresh_model_routing_tables(model_state)
             self._densify_routing_tables(model_state)
