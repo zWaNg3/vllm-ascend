@@ -8,7 +8,6 @@ scale-down additionally behind ``has_npu_scale_down_capability()`` (CANN V3+).
 
 import contextlib
 import json
-import logging
 import os
 import threading
 import time
@@ -26,8 +25,6 @@ from tests.e2e.conftest import RemoteOpenAIServer
 
 MODEL_NAME = os.getenv("MODEL_NAME", "vllm-ascend/Qwen3-30B-A3B-W8A8")
 DP_SIZE = 4
-
-logger = logging.getLogger(__name__)
 
 # Fault-detection timeout budget:
 # - CPU: Gloo DP allreduce timeout detects the dead peer.
@@ -632,11 +629,11 @@ def test_scale_down_removes_dead_rank_and_recovers():
                 "expert redistribution or weight reload likely failed"
             )
         _in_parallel(lambda s: _complete(s.get_client()), survivors)
-        logger.info(
-            "[FT] scale_down e2e: fault_detection=%.2f s, command_to_healthy=%.2f s, kill_to_healthy=%.2f s",
-            detection_s,
-            time.monotonic() - command_at,
-            time.monotonic() - kill_at,
+        print(
+            "[FT] scale_down e2e: "
+            f"fault_detection={detection_s:.2f} s, "
+            f"command_to_healthy={time.monotonic() - command_at:.2f} s, "
+            f"kill_to_healthy={time.monotonic() - kill_at:.2f} s"
         )
 
         # 7. Factual answers on the survivors: the re-hosted experts must
