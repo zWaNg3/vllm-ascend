@@ -182,7 +182,9 @@ def reload_experts_layerwise(
                     )
 
     with _phase(metrics, "layerwise_load"):
-        model.load_weights(filtered_weights())
+        loaded = model.load_weights(filtered_weights())
+    if metrics is not None and loaded:
+        metrics.add_value("layerwise_loaded_params", len(loaded))
 
     unmatched = set(layer_indices) - matched_layers
     if unmatched:
